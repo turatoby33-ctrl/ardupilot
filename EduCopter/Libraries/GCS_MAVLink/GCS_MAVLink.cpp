@@ -2,6 +2,11 @@
 #include "../AP_HAL/AP_HAL.h"
 #include <cstring>
 #include <cstdio>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <fcntl.h>
 
 extern AP_HAL* hal;
 
@@ -15,13 +20,52 @@ GCS_MAVLink::GCS_MAVLink(AP_AHRS& ahrs, AP_GPS& gps, AP_Baro& baro) :
     _last_position_us(0),
     _last_vfr_us(0),
     _system_id(1),
-    _component_id(1)
+    _component_id(1),
+    _udp_socket(-1),
+    _udp_port(14550),
+    _initialized(false)
 {
+}
+
+GCS_MAVLink::~GCS_MAVLink() {
+    if (_udp_socket >= 0) {
+        close(_udp_socket);
+    }
+}
+
+bool GCS_MAVLink::setup_udp() {
+    // Create UDP socket
+    _udp_socket = socket(AF_INET, SOCK_DGRAM, 0);
+    if (_udp_socket < 0) {
+        printf("GCS_MAVLink: ERROR - Failed to create UDP socket\n");
+        return false;
+    }
+
+    // Set non-blocking
+    int flags = fcntl(_udp_socket, F_GETFL, 0);
+    fcntl(_udp_socket, F_SETFL, flags | O_NONBLOCK);
+
+    // Set broadcast permission
+    int broadcast = 1;
+    setsockopt(_udp_socket, SOL_SOCKET, SO_BROADCAST, &broadcast, sizeof(broadcast));
+
+    printf("GCS_MAVLink: UDP socket created on port %d\n", _udp_port);
+    printf("GCS_MAVLink: Waiting for QGroundControl connection...\n");
+    printf("GCS_MAVLink: QGC should auto-detect on UDP port %d\n", _udp_port);
+
+    return true;
 }
 
 void GCS_MAVLink::init() {
     printf("GCS_MAVLink: Initializing MAVLink communication\n");
     printf("GCS_MAVLink: System ID: %d, Component ID: %d\n", _system_id, _component_id);
+
+    if (setup_udp()) {
+        _initialized = true;
+        printf("GCS_MAVLink: Ready for QGroundControl\n");
+    } else {
+        printf("GCS_MAVLink: WARNING - UDP setup failed, MAVLink disabled\n");
+    }
 }
 
 void GCS_MAVLink::update() {
@@ -241,7 +285,26 @@ void GCS_MAVLink::build_global_position_packet(uint8_t* buf, uint16_t& len) {
 }
 
 void GCS_MAVLink::send_packet(const uint8_t* buf, uint16_t len) {
-    // In a real implementation, this would send via serial/UDP
-    // For now, we just log that a packet was sent
-    // printf("MAVLink: Sent packet (msg_id=%d, len=%d)\n", buf[5], len);
+    if (!_initialized || _udp_socket < 0) {
+        return;
+    }
+
+    // Send to QGroundControl (localhost for testing)
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(_udp_port);
+    addr.sin_addr.s_addr = inet_addr("127.0.0.1");  // Localhost
+
+    ssize_t sent = sendto(_udp_socket, buf, len, 0, (struct sockaddr*)&addr, sizeof(addr));
+
+    if (sent < 0) {
+        // Don't spam errors
+        static uint32_t last_error_ms = 0;
+        uint32_t now_ms = hal->millis();
+        if (now_ms - last_error_ms > 5000) {
+            printf("GCS_MAVLink: WARNING - Failed to send packet\n");
+            last_error_ms = now_ms;
+        }
+    }
 }

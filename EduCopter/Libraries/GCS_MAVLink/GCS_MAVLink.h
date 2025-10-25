@@ -31,6 +31,7 @@
 class GCS_MAVLink {
 public:
     GCS_MAVLink(AP_AHRS& ahrs, AP_GPS& gps, AP_Baro& baro);
+    ~GCS_MAVLink();
 
     void init();
     void update();
@@ -48,6 +49,9 @@ public:
     // Set streams
     void set_stream_rate(uint16_t rate_hz) { _stream_rate_hz = rate_hz; }
 
+    // UDP connection status
+    bool is_connected() const { return _udp_socket >= 0; }
+
 private:
     AP_AHRS& _ahrs;
     AP_GPS& _gps;
@@ -62,8 +66,16 @@ private:
     uint8_t _system_id;
     uint8_t _component_id;
 
+    // UDP connection
+    int _udp_socket;
+    uint16_t _udp_port;
+    bool _initialized;
+
     // Helper to send MAVLink packet
     void send_packet(const uint8_t* buf, uint16_t len);
+
+    // UDP setup
+    bool setup_udp();
 
     // Simple packet building
     void build_heartbeat_packet(uint8_t* buf, uint16_t& len, bool armed, uint8_t flight_mode);
