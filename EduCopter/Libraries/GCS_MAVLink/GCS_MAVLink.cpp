@@ -289,12 +289,12 @@ void GCS_MAVLink::send_packet(const uint8_t* buf, uint16_t len) {
         return;
     }
 
-    // Send to QGroundControl (localhost for testing)
+    // Send to QGroundControl (broadcast for WSL/Linux compatibility)
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_port = htons(_udp_port);
-    addr.sin_addr.s_addr = inet_addr("127.0.0.1");  // Localhost
+    addr.sin_addr.s_addr = htonl(INADDR_BROADCAST);  // Broadcast to all interfaces
 
     ssize_t sent = sendto(_udp_socket, buf, len, 0, (struct sockaddr*)&addr, sizeof(addr));
 
