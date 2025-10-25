@@ -174,3 +174,6 @@ venv.bak/
 autotest_result_*_junit.xml
 .python-version
 EduCopter-complete.tar.gz
+*.tar.gz
+*.git
+educopter-bundle.git
