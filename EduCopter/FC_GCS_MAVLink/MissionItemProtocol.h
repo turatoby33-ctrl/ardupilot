@@ -37,9 +37,10 @@ class MissionItemProtocol {
 public:
     /**
      * @brief Constructor
+     * @param channel GCS channel for communication
      * @param missionType Type of mission (waypoint/fence/rally)
      */
-    explicit MissionItemProtocol(MAV_MISSION_TYPE missionType);
+    explicit MissionItemProtocol(GCSChannel& channel, MAV_MISSION_TYPE missionType);
 
     /**
      * @brief Virtual destructor
@@ -203,6 +204,7 @@ protected:
 private:
     // ========== MEMBER VARIABLES ==========
 
+    GCSChannel& m_channel;          ///< GCS channel reference
     MAV_MISSION_TYPE m_missionType; ///< Type of mission
     bool m_receiving;               ///< Currently receiving items
     bool m_sending;                 ///< Currently sending items

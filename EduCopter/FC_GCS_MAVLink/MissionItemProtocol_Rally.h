@@ -26,8 +26,9 @@ class MissionItemProtocol_Rally : public MissionItemProtocol {
 public:
     /**
      * @brief Constructor
+     * @param channel GCS channel for communication
      */
-    MissionItemProtocol_Rally();
+    explicit MissionItemProtocol_Rally(GCSChannel& channel);
 
     /**
      * @brief Destructor

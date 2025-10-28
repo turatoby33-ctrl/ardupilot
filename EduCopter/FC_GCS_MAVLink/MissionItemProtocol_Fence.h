@@ -26,8 +26,9 @@ class MissionItemProtocol_Fence : public MissionItemProtocol {
 public:
     /**
      * @brief Constructor
+     * @param channel GCS channel for communication
      */
-    MissionItemProtocol_Fence();
+    explicit MissionItemProtocol_Fence(GCSChannel& channel);
 
     /**
      * @brief Destructor

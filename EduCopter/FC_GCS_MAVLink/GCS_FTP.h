@@ -178,8 +178,9 @@ class GCS_FTP {
 public:
     /**
      * @brief Constructor
+     * @param channel GCS channel for communication
      */
-    GCS_FTP();
+    explicit GCS_FTP(GCSChannel& channel);
 
     /**
      * @brief Destructor

@@ -26,8 +26,9 @@ class MissionItemProtocol_Waypoints : public MissionItemProtocol {
 public:
     /**
      * @brief Constructor
+     * @param channel GCS channel for communication
      */
-    MissionItemProtocol_Waypoints();
+    explicit MissionItemProtocol_Waypoints(GCSChannel& channel);
 
     /**
      * @brief Destructor
