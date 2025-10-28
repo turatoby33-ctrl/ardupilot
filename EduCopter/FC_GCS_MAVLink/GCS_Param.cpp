@@ -348,7 +348,7 @@ bool GCSChannel::sendParameterMetadata(uint16_t index)
  */
 extern bool saveParameters();
 
-MAV_RESULT GCSChannel::handleCommandPreflight​Storage(const mavlink_command_long_t& cmd)
+MAV_RESULT GCSChannel::handleCommandPreflightStorage(const mavlink_command_long_t& cmd)
 {
     // param1: 0=read, 1=write, 2=reset
     int action = (int)cmd.param1;

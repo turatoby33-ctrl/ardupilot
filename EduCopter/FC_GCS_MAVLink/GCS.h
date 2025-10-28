@@ -345,6 +345,7 @@ protected:
     // ========== COMMAND HANDLERS ==========
 
     MAV_RESULT handleCommandPreflightCalibration(const mavlink_command_long_t& cmd);
+    MAV_RESULT handleCommandPreflightStorage(const mavlink_command_long_t& cmd);
     MAV_RESULT handleCommandComponentArmDisarm(const mavlink_command_long_t& cmd);
     MAV_RESULT handleCommandDoSetHome(const mavlink_command_long_t& cmd);
     MAV_RESULT handleCommandDoSetMode(const mavlink_command_long_t& cmd);
