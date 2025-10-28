@@ -3,28 +3,44 @@
  * @brief EduCopter Common GCS Message Handlers
  *
  * Implements all common MAVLink message send/receive functions.
- * This is the largest file containing 100+ message handlers.
+ * This is the largest file containing message handlers for heartbeat,
+ * status, attitude, position, commands, and more.
  *
- * @author EduCopter Project
- * @date 2025-10-28
- * @version 1.0.0
+ * @author EduCopter Development Team
+ * @date 2025
  */
 
 #include "GCS.h"
+#include "GCS_config.h"
+#include <cstring>
+#include <cstdio>
 
 #if EDUCOPTER_GCS_ENABLED
 
 // External vehicle functions (must be provided by vehicle code)
 extern uint32_t millis();
+extern uint16_t millis16();
 extern float getAttitudeRoll();
 extern float getAttitudePitch();
 extern float getAttitudeYaw();
+extern float getAttitudeRollRate();
+extern float getAttitudePitchRate();
+extern float getAttitudeYawRate();
 extern int32_t getLatitude();
 extern int32_t getLongitude();
 extern float getAltitude();
+extern float getRelativeAltitude();
+extern int16_t getVelocityX();
+extern int16_t getVelocityY();
+extern int16_t getVelocityZ();
+extern uint16_t getHeading();
 extern float getBatteryVoltage();
 extern float getBatteryCurrent();
-// ... more extern functions ...
+extern int8_t getBatteryRemaining();
+extern uint16_t getCPULoad();
+extern uint32_t getSensorsPresentMask();
+extern uint32_t getSensorsEnabledMask();
+extern uint32_t getSensorsHealthMask();
 
 namespace EduCopter {
 namespace GCS {
@@ -48,9 +64,7 @@ void GCSChannel::sendHeartbeat() {
         getSystemStatus()
     );
 
-    uint16_t len;
-    const uint8_t* buf = m_mavlink.packMessage(msg, len);
-    // Send via UART: uart->write(buf, len);
+    sendMessage(&msg);
 }
 
 void GCSChannel::sendSystemStatus() {
@@ -59,13 +73,13 @@ void GCSChannel::sendSystemStatus() {
     }
 
     // Gather system status
-    uint32_t onboard_control_sensors_present = 0xFFFFFFFF;
-    uint32_t onboard_control_sensors_enabled = 0xFFFFFFFF;
-    uint32_t onboard_control_sensors_health = 0xFFFFFFFF;
-    uint16_t load = 500; // CPU load in d%
+    uint32_t onboard_control_sensors_present = getSensorsPresentMask();
+    uint32_t onboard_control_sensors_enabled = getSensorsEnabledMask();
+    uint32_t onboard_control_sensors_health = getSensorsHealthMask();
+    uint16_t load = getCPULoad(); // CPU load in d%
     uint16_t voltage_battery = (uint16_t)(getBatteryVoltage() * 1000);
     int16_t current_battery = (int16_t)(getBatteryCurrent() * 100);
-    int8_t battery_remaining = 50; // Percent
+    int8_t battery_remaining = getBatteryRemaining();
 
     mavlink_message_t msg;
     mavlink_msg_sys_status_pack(
@@ -82,9 +96,7 @@ void GCSChannel::sendSystemStatus() {
         0, 0, 0, 0, 0, 0, 0
     );
 
-    uint16_t len;
-    const uint8_t* buf = m_mavlink.packMessage(msg, len);
-    // Send via UART
+    sendMessage(&msg);
 }
 
 void GCSChannel::sendAttitude() {
@@ -101,14 +113,12 @@ void GCSChannel::sendAttitude() {
         getAttitudeRoll(),
         getAttitudePitch(),
         getAttitudeYaw(),
-        0.0f, // rollspeed
-        0.0f, // pitchspeed
-        0.0f  // yawspeed
+        getAttitudeRollRate(),
+        getAttitudePitchRate(),
+        getAttitudeYawRate()
     );
 
-    uint16_t len;
-    const uint8_t* buf = m_mavlink.packMessage(msg, len);
-    // Send via UART
+    sendMessage(&msg);
 }
 
 void GCSChannel::sendGlobalPosition() {
@@ -125,14 +135,14 @@ void GCSChannel::sendGlobalPosition() {
         getLatitude(),
         getLongitude(),
         (int32_t)(getAltitude() * 1000), // alt in mm
-        (int32_t)(getAltitude() * 1000), // relative_alt in mm
-        0, 0, 0, // vx, vy, vz
-        0  // hdg
+        (int32_t)(getRelativeAltitude() * 1000), // relative_alt in mm
+        getVelocityX(),
+        getVelocityY(),
+        getVelocityZ(),
+        getHeading()
     );
 
-    uint16_t len;
-    const uint8_t* buf = m_mavlink.packMessage(msg, len);
-    // Send via UART
+    sendMessage(&msg);
 }
 
 // Additional send functions would be implemented here...
@@ -141,7 +151,7 @@ void GCSChannel::sendGlobalPosition() {
 
 // ========== COMMAND HANDLERS ==========
 
-MAV_RESULT GCSChannel::handleCommandPreflightCalibration(const mavlink_command_int_t& cmd) {
+MAV_RESULT GCSChannel::handleCommandPreflightCalibration(const mavlink_command_long_t& cmd) {
     // Handle preflight calibration commands
     // param1: gyro cal
     // param2: mag cal
@@ -168,7 +178,7 @@ MAV_RESULT GCSChannel::handleCommandPreflightCalibration(const mavlink_command_i
     return MAV_RESULT_UNSUPPORTED;
 }
 
-MAV_RESULT GCSChannel::handleCommandComponentArmDisarm(const mavlink_command_int_t& cmd) {
+MAV_RESULT GCSChannel::handleCommandComponentArmDisarm(const mavlink_command_long_t& cmd) {
     bool arm = (cmd.param1 > 0.5f);
 
     if (arm) {
@@ -184,7 +194,7 @@ MAV_RESULT GCSChannel::handleCommandComponentArmDisarm(const mavlink_command_int
     }
 }
 
-MAV_RESULT GCSChannel::handleCommandDoSetHome(const mavlink_command_int_t& cmd) {
+MAV_RESULT GCSChannel::handleCommandDoSetHome(const mavlink_command_long_t& cmd) {
     bool use_current = (cmd.param1 > 0.5f);
 
     if (use_current) {
@@ -193,45 +203,51 @@ MAV_RESULT GCSChannel::handleCommandDoSetHome(const mavlink_command_int_t& cmd) 
         return MAV_RESULT_ACCEPTED;
     } else {
         // Set home to specified position
-        // Use cmd.x (latitude), cmd.y (longitude), cmd.z (altitude)
+        // Use cmd.param5 (latitude), cmd.param6 (longitude), cmd.param7 (altitude)
         sendText(MAV_SEVERITY_INFO, "Home set to specified position");
         return MAV_RESULT_ACCEPTED;
     }
 }
 
-MAV_RESULT GCSChannel::handleCommandDoSetMode(const mavlink_command_int_t& cmd) {
+MAV_RESULT GCSChannel::handleCommandDoSetMode(const mavlink_command_long_t& cmd) {
     uint8_t base_mode = (uint8_t)cmd.param1;
     uint32_t custom_mode = (uint32_t)cmd.param2;
 
     // Set flight mode
-    sendTextF(MAV_SEVERITY_INFO, "Mode change to %u", custom_mode);
+    char buf[80];
+    snprintf(buf, sizeof(buf), "Mode change to %u", custom_mode);
+    sendText(MAV_SEVERITY_INFO, buf);
     // Call vehicle set_mode function
 
     return MAV_RESULT_ACCEPTED;
 }
 
-MAV_RESULT GCSChannel::handleCommandGetHomePosition(const mavlink_command_int_t& cmd) {
+MAV_RESULT GCSChannel::handleCommandGetHomePosition(const mavlink_command_long_t& cmd) {
     // Send HOME_POSITION message
     sendText(MAV_SEVERITY_INFO, "Sending home position");
     // sendHomePosition();
     return MAV_RESULT_ACCEPTED;
 }
 
-MAV_RESULT GCSChannel::handleCommandSetMessageInterval(const mavlink_command_int_t& cmd) {
+MAV_RESULT GCSChannel::handleCommandSetMessageInterval(const mavlink_command_long_t& cmd) {
     uint32_t msg_id = (uint32_t)cmd.param1;
     int32_t interval_us = (int32_t)cmd.param2;
 
     // Set message interval
-    sendTextF(MAV_SEVERITY_INFO, "Set msg %u interval %d", msg_id, interval_us);
+    char buf[80];
+    snprintf(buf, sizeof(buf), "Set msg %u interval %d", msg_id, interval_us);
+    sendText(MAV_SEVERITY_INFO, buf);
 
     return MAV_RESULT_ACCEPTED;
 }
 
-MAV_RESULT GCSChannel::handleCommandRequestMessage(const mavlink_command_int_t& cmd) {
+MAV_RESULT GCSChannel::handleCommandRequestMessage(const mavlink_command_long_t& cmd) {
     uint32_t msg_id = (uint32_t)cmd.param1;
 
     // Send requested message immediately
-    sendTextF(MAV_SEVERITY_INFO, "Sending msg %u", msg_id);
+    char buf[80];
+    snprintf(buf, sizeof(buf), "Sending msg %u", msg_id);
+    sendText(MAV_SEVERITY_INFO, buf);
 
     return MAV_RESULT_ACCEPTED;
 }
@@ -240,12 +256,15 @@ MAV_RESULT GCSChannel::handleCommandRequestMessage(const mavlink_command_int_t& 
 
 // ========== MESSAGE HANDLERS ==========
 
-void GCSChannel::handleCommandInt(const mavlink_message_t& msg) {
-    mavlink_command_int_t cmd;
-    mavlink_msg_command_int_decode(&msg, &cmd);
+void GCSChannel::handleCommandLong(const mavlink_message_t& msg) {
+    mavlink_command_long_t cmd;
+    mavlink_msg_command_long_decode(&msg, &cmd);
 
     // Check if command is for us
-    // if (cmd.target_system != m_mavlink.getSystemID()) return;
+    if (cmd.target_system != m_mavlink.getSystemID() &&
+        cmd.target_system != 0) {
+        return;
+    }
 
     MAV_RESULT result = MAV_RESULT_UNSUPPORTED;
 
@@ -295,39 +314,38 @@ void GCSChannel::handleCommandInt(const mavlink_message_t& msg) {
         0, 0, 0, 0
     );
 
-    uint16_t len;
-    const uint8_t* buf = m_mavlink.packMessage(ack_msg, len);
-    // Send via UART
+    sendMessage(&ack_msg);
 }
 
-void GCSChannel::handleCommandLong(const mavlink_message_t& msg) {
-    // Convert COMMAND_LONG to COMMAND_INT and handle
-    mavlink_command_long_t cmd_long;
-    mavlink_msg_command_long_decode(&msg, &cmd_long);
-
+void GCSChannel::handleCommandInt(const mavlink_message_t& msg) {
+    // COMMAND_INT is similar to COMMAND_LONG but with integer coordinates
+    // For now, convert to COMMAND_LONG and handle
     mavlink_command_int_t cmd_int;
-    cmd_int.target_system = cmd_long.target_system;
-    cmd_int.target_component = cmd_long.target_component;
-    cmd_int.command = cmd_long.command;
-    cmd_int.param1 = cmd_long.param1;
-    cmd_int.param2 = cmd_long.param2;
-    cmd_int.param3 = cmd_long.param3;
-    cmd_int.param4 = cmd_long.param4;
-    cmd_int.x = 0;
-    cmd_int.y = 0;
-    cmd_int.z = cmd_long.param7;
-    cmd_int.frame = MAV_FRAME_GLOBAL;
+    mavlink_msg_command_int_decode(&msg, &cmd_int);
+
+    mavlink_command_long_t cmd_long;
+    cmd_long.target_system = cmd_int.target_system;
+    cmd_long.target_component = cmd_int.target_component;
+    cmd_long.command = cmd_int.command;
+    cmd_long.confirmation = 0;
+    cmd_long.param1 = cmd_int.param1;
+    cmd_long.param2 = cmd_int.param2;
+    cmd_long.param3 = cmd_int.param3;
+    cmd_long.param4 = cmd_int.param4;
+    cmd_long.param5 = cmd_int.x;
+    cmd_long.param6 = cmd_int.y;
+    cmd_long.param7 = cmd_int.z;
 
     // Create fake message and handle
-    mavlink_message_t int_msg;
-    mavlink_msg_command_int_encode(
+    mavlink_message_t long_msg;
+    mavlink_msg_command_long_encode(
         m_mavlink.getSystemID(),
         m_mavlink.getComponentID(),
-        &int_msg,
-        &cmd_int
+        &long_msg,
+        &cmd_long
     );
 
-    handleCommandInt(int_msg);
+    handleCommandLong(long_msg);
 }
 
 // ========== PLACEHOLDER IMPLEMENTATIONS ==========
