@@ -95,6 +95,12 @@ public:
     void sendMessage(MessageID msgID);
 
     /**
+     * @brief Send a MAVLink message immediately
+     * @param msg Pointer to packed MAVLink message
+     */
+    void sendMessage(const mavlink_message_t* msg);
+
+    /**
      * @brief Send text to GCS
      * @param severity Message severity
      * @param text Message text
@@ -225,6 +231,103 @@ protected:
     void sendExtendedSysState();
     void sendAutopilotVersion();
 
+    // ========== PARAMETER FUNCTIONS ==========
+
+    void sendParameter(uint16_t index);
+    void sendParameterByName(const char* name);
+    void updateParamStream();
+    void cancelParamStream();
+    bool isStreamingParams() const;
+    void sendParameterCount();
+    void sendParametersByPrefix(const char* prefix);
+    bool isValidParameterIndex(uint16_t index) const;
+
+    // ========== STREAM RATE FUNCTIONS ==========
+
+    void handleRequestDataStream(const mavlink_message_t& msg);
+    MAV_RESULT handleCommandGetMessageInterval(const mavlink_command_long_t& cmd);
+    MessageID mavlinkIDToMessageID(uint32_t mavlinkID);
+    uint16_t getDefaultMessageInterval(MessageID msgID);
+    void resetStreamRates();
+    void disableAllStreams();
+    void sendStreamConfig();
+    void setMessageInterval(MessageID msgID, uint16_t intervalMS);
+    uint16_t getMessageInterval(MessageID msgID) const;
+
+    // ========== FENCE FUNCTIONS ==========
+
+    MAV_RESULT handleCommandFenceEnable(const mavlink_command_long_t& cmd);
+    void sendFenceStatus();
+    void sendFenceBreachNotification();
+    void sendFenceInfo();
+    bool setFenceParameter(const char* paramName, float value);
+    void checkFenceHealth();
+    void updateFence();
+
+    // ========== RALLY FUNCTIONS ==========
+
+    void sendRallyPoint(uint16_t index);
+    void sendRallyInfo();
+    void sendNearestRallyDistance();
+    MAV_RESULT handleCommandSetRally(const mavlink_command_long_t& cmd);
+    void sendActiveRallyInfo();
+    void checkRallyHealth();
+    void sendAllRallyDistances();
+    void updateRally();
+
+    // ========== SERVO/RELAY FUNCTIONS ==========
+
+    MAV_RESULT handleCommandSetServo(const mavlink_command_long_t& cmd);
+    MAV_RESULT handleCommandSetRelay(const mavlink_command_long_t& cmd);
+    MAV_RESULT handleCommandRepeatServo(const mavlink_command_long_t& cmd);
+    MAV_RESULT handleCommandRepeatRelay(const mavlink_command_long_t& cmd);
+    void updateServoRelay();
+    void sendRelayStatus();
+
+    // ========== SIGNING FUNCTIONS ==========
+
+    bool initializeSigning();
+    bool setSigningEnabled(bool enabled);
+    bool isSigningEnabled() const;
+    void setAcceptUnsignedMessages(bool accept);
+    bool signMessage(mavlink_message_t* msg);
+    bool verifyMessageSignature(const mavlink_message_t* msg);
+    void handleSetupSigning(const mavlink_message_t& msg);
+    void sendSigningStatus();
+    bool generateSigningKey();
+
+    // ========== SERIAL CONTROL FUNCTIONS ==========
+
+    void handleSerialControl(const mavlink_message_t& msg);
+    void sendSerialControlResponse(uint8_t device, uint8_t flags);
+    void updateSerialControl();
+    void closeSerialControl();
+    void sendSerialStatus();
+    void handleGPSPassthrough(bool enable);
+
+    // ========== DEVICE OPERATION FUNCTIONS ==========
+
+    void handleDeviceOpRead(const mavlink_message_t& msg);
+    void handleDeviceOpWrite(const mavlink_message_t& msg);
+    void sendDeviceOpReadReply(uint32_t requestID, uint8_t result,
+                               const uint8_t* data, uint8_t length);
+    void sendDeviceOpWriteReply(uint32_t requestID, uint8_t result);
+    bool readSensorRegister(uint8_t sensorType, uint8_t regAddr, uint8_t& outValue);
+    bool writeSensorRegister(uint8_t sensorType, uint8_t regAddr, uint8_t value);
+    void dumpSensorRegisters(uint8_t sensorType);
+
+    // ========== MISSION FUNCTION HELPERS ==========
+
+    void sendCurrentWaypoint();
+    void sendWaypointReached(uint16_t index);
+    void sendWaypointDistance();
+    bool isMissionValid();
+
+    // ========== HELPER FUNCTIONS ==========
+
+    uint8_t getSystemID() const { return m_mavlink.getSystemID(); }
+    uint8_t getComponentID() const { return m_mavlink.getComponentID(); }
+
     // ========== COMMON MESSAGE HANDLERS ==========
 
     void handleHeartbeat(const mavlink_message_t& msg);
@@ -241,13 +344,13 @@ protected:
 
     // ========== COMMAND HANDLERS ==========
 
-    MAV_RESULT handleCommandPreflight Calibration(const mavlink_command_int_t& cmd);
-    MAV_RESULT handleCommandComponentArmDisarm(const mavlink_command_int_t& cmd);
-    MAV_RESULT handleCommandDoSetHome(const mavlink_command_int_t& cmd);
-    MAV_RESULT handleCommandDoSetMode(const mavlink_command_int_t& cmd);
-    MAV_RESULT handleCommandGetHomePosition(const mavlink_command_int_t& cmd);
-    MAV_RESULT handleCommandSetMessageInterval(const mavlink_command_int_t& cmd);
-    MAV_RESULT handleCommandRequestMessage(const mavlink_command_int_t& cmd);
+    MAV_RESULT handleCommandPreflightCalibration(const mavlink_command_long_t& cmd);
+    MAV_RESULT handleCommandComponentArmDisarm(const mavlink_command_long_t& cmd);
+    MAV_RESULT handleCommandDoSetHome(const mavlink_command_long_t& cmd);
+    MAV_RESULT handleCommandDoSetMode(const mavlink_command_long_t& cmd);
+    MAV_RESULT handleCommandGetHomePosition(const mavlink_command_long_t& cmd);
+    MAV_RESULT handleCommandSetMessageInterval(const mavlink_command_long_t& cmd);
+    MAV_RESULT handleCommandRequestMessage(const mavlink_command_long_t& cmd);
 
     // ========== MESSAGE SCHEDULING ==========
 
