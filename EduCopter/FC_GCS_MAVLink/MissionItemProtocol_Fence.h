@@ -1,54 +1,53 @@
+/**
+ * @file MissionItemProtocol_Fence.h
+ * @brief EduCopter Geofence Protocol
+ *
+ * Handles upload/download of geofence points.
+ *
+ * @author EduCopter Project
+ * @date 2025-10-28
+ * @version 1.0.0
+ */
+
 #pragma once
 
 #include "MissionItemProtocol.h"
 
-#include <AC_Fence/AC_Fence.h>
+#if EDUCOPTER_FENCE_ENABLED
 
-class AC_PolyFence_loader;
+namespace EduCopter {
+namespace GCS {
 
+/**
+ * @class MissionItemProtocol_Fence
+ * @brief Geofence transfer protocol
+ */
 class MissionItemProtocol_Fence : public MissionItemProtocol {
 public:
-    MissionItemProtocol_Fence(class AC_Fence &fence) :
-        _fence(fence) {}
+    /**
+     * @brief Constructor
+     * @param channel GCS channel for communication
+     */
+    explicit MissionItemProtocol_Fence(GCSChannel& channel);
 
-    MAV_MISSION_TYPE mission_type() const override {
-        return MAV_MISSION_TYPE_FENCE;
-    }
-
-    void truncate(const mavlink_mission_count_t &packet) override;
-    MAV_MISSION_RESULT complete(const GCS_MAVLINK &_link) override;
-    void timeout() override;
-
-    /*
-      static function to format mission item as mavlink_mission_item_int_t
-    */
-    static bool get_item_as_mission_item(uint16_t seq, mavlink_mission_item_int_t &ret_packet);
-
-    static MAV_MISSION_RESULT convert_MISSION_ITEM_INT_to_AC_PolyFenceItem(const mavlink_mission_item_int_t &mission_item_int, class AC_PolyFenceItem &ret);
+    /**
+     * @brief Destructor
+     */
+    ~MissionItemProtocol_Fence() override = default;
 
 protected:
-
-    ap_message next_item_ap_message_id() const override {
-        return MSG_NEXT_MISSION_REQUEST_FENCE;
-    }
-    bool clear_all_items() override WARN_IF_UNUSED;
-
-private:
-    class AC_Fence &_fence;
-
-    uint16_t item_count() const override;
-    uint16_t max_items() const override;
-
-    MAV_MISSION_RESULT replace_item(const mavlink_mission_item_int_t&) override WARN_IF_UNUSED;
-    MAV_MISSION_RESULT append_item(const mavlink_mission_item_int_t&) override WARN_IF_UNUSED;
-
-    MAV_MISSION_RESULT get_item(uint16_t seq, mavlink_mission_item_int_t &ret_packet) override WARN_IF_UNUSED;
-
-    void free_upload_resources() override;
-    MAV_MISSION_RESULT allocate_receive_resources(const uint16_t count) override WARN_IF_UNUSED;
-    MAV_MISSION_RESULT allocate_update_resources() override WARN_IF_UNUSED;
-
-    class AC_PolyFenceItem *_new_items;
-    uint16_t _new_items_count;
-    uint8_t *_updated_mask;
+    // Override base class methods
+    uint16_t getItemCount() const override;
+    uint16_t getMaxItems() const override;
+    MAV_MISSION_RESULT getItem(uint16_t index, mavlink_mission_item_int_t& item) override;
+    MAV_MISSION_RESULT appendItem(const mavlink_mission_item_int_t& item) override;
+    MAV_MISSION_RESULT replaceItem(uint16_t index, const mavlink_mission_item_int_t& item) override;
+    bool clearAllItems() override;
+    bool truncate(uint16_t count) override;
+    MAV_MISSION_RESULT onComplete(GCSChannel* channel) override;
 };
+
+} // namespace GCS
+} // namespace EduCopter
+
+#endif // EDUCOPTER_FENCE_ENABLED

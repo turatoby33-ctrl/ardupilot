@@ -1,134 +1,383 @@
-/*
-  Implementation details for transfering waypoint information using
-  the MISSION_ITEM protocol to and from a GCS.
-
-  This program is free software: you can redistribute it and/or modify
-  it under the terms of the GNU General Public License as published by
-  the Free Software Foundation, either version 3 of the License, or
-  (at your option) any later version.
-
-  This program is distributed in the hope that it will be useful,
-  but WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-  GNU General Public License for more details.
-
-  You should have received a copy of the GNU General Public License
-  along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*/
-
-#include "GCS_config.h"
-#include <AP_Mission/AP_Mission_config.h>
-
-#if HAL_GCS_ENABLED && AP_MISSION_ENABLED
+/**
+ * @file MissionItemProtocol_Waypoints.cpp
+ * @brief Waypoint mission item protocol implementation
+ *
+ * This file implements the waypoint-specific mission protocol for EduCopter.
+ * Handles upload/download of waypoint missions including:
+ * - Takeoff
+ * - Navigate to waypoint
+ * - Land
+ * - Return to launch
+ * - Loiter
+ * - Change speed/altitude
+ * - Do commands (set servo, etc.)
+ *
+ * @author EduCopter Development Team
+ * @date 2025
+ */
 
 #include "MissionItemProtocol_Waypoints.h"
-
-#include <AP_Logger/AP_Logger.h>
-#include <AP_Mission/AP_Mission.h>
-
 #include "GCS.h"
+#include <cstring>
+#include <cmath>
 
-MAV_MISSION_RESULT MissionItemProtocol_Waypoints::append_item(const mavlink_mission_item_int_t &mission_item_int)
+namespace EduCopter {
+namespace GCS {
+
+// External mission storage interface (implemented by vehicle)
+extern uint16_t getWaypointCount();
+extern bool getWaypoint(uint16_t index, mavlink_mission_item_int_t& outItem);
+extern bool setWaypoint(uint16_t index, const mavlink_mission_item_int_t& item);
+extern bool appendWaypoint(const mavlink_mission_item_int_t& item);
+extern bool clearWaypoints();
+extern uint16_t getCurrentWaypointIndex();
+extern bool setCurrentWaypoint(uint16_t index);
+
+// Maximum waypoints supported
+static const uint16_t MAX_WAYPOINTS = 255;
+
+/**
+ * @brief Constructor
+ */
+MissionItemProtocol_Waypoints::MissionItemProtocol_Waypoints(GCSChannel& channel)
+    : MissionItemProtocol(channel, MAV_MISSION_TYPE_MISSION)
 {
-    // sanity check for DO_JUMP command
-    AP_Mission::Mission_Command cmd {};
-
-    const MAV_MISSION_RESULT res = AP_Mission::mavlink_int_to_mission_cmd(mission_item_int, cmd);
-    if (res != MAV_MISSION_ACCEPTED) {
-        return res;
-    }
-
-    if (cmd.id == MAV_CMD_DO_JUMP) {
-        if ((cmd.content.jump.target >= item_count() && cmd.content.jump.target > request_last) || cmd.content.jump.target == 0) {
-            return MAV_MISSION_ERROR;
-        }
-    }
-
-    if (!mission.add_cmd(cmd)) {
-        return MAV_MISSION_ERROR;
-    }
-    return MAV_MISSION_ACCEPTED;
 }
 
-bool MissionItemProtocol_Waypoints::clear_all_items()
+/**
+ * @brief Get total waypoint count
+ */
+uint16_t MissionItemProtocol_Waypoints::getItemCount() const
 {
-    return mission.clear();
+    return getWaypointCount();
 }
 
-MAV_MISSION_RESULT MissionItemProtocol_Waypoints::complete(const GCS_MAVLINK &_link)
+/**
+ * @brief Get maximum waypoint capacity
+ */
+uint16_t MissionItemProtocol_Waypoints::getMaxItemCount() const
 {
-    _link.send_text(MAV_SEVERITY_INFO, "Flight plan received");
-#if HAL_LOGGING_ENABLED
-    AP::logger().Write_EntireMission();
-#endif
-    return MAV_MISSION_ACCEPTED;
+    return MAX_WAYPOINTS;
 }
 
-MAV_MISSION_RESULT MissionItemProtocol_Waypoints::get_item(uint16_t seq, mavlink_mission_item_int_t &ret_packet)
+/**
+ * @brief Get waypoint item by index
+ *
+ * Retrieves a waypoint from storage and formats it as MAVLink mission item.
+ *
+ * @param index Waypoint index
+ * @param outItem Output mission item
+ * @return Mission result code
+ */
+MAV_MISSION_RESULT MissionItemProtocol_Waypoints::getItem(
+    uint16_t index,
+    mavlink_mission_item_int_t& outItem)
 {
-    if (seq != 0 && // always allow HOME to be read
-        seq >= mission.num_commands()) {
+    if (index >= getWaypointCount()) {
         return MAV_MISSION_INVALID_SEQUENCE;
     }
 
-    AP_Mission::Mission_Command cmd;
-
-    // retrieve mission from eeprom
-    if (!mission.read_cmd_from_storage(seq, cmd)) {
+    if (!getWaypoint(index, outItem)) {
         return MAV_MISSION_ERROR;
     }
 
-    if (!AP_Mission::mission_cmd_to_mavlink_int(cmd, ret_packet)) {
-        return MAV_MISSION_ERROR;
-    }
-    ret_packet.mission_type = MAV_MISSION_TYPE_MISSION;
+    // Set target system/component for response
+    outItem.target_system = getTargetSystem();
+    outItem.target_component = getTargetComponent();
+    outItem.seq = index;
+    outItem.mission_type = MAV_MISSION_TYPE_MISSION;
 
-    // set packet's current field to 1 if this is the command being executed
-    if (cmd.id == (uint16_t)mission.get_current_nav_cmd().index) {
-        ret_packet.current = 1;
+    return MAV_MISSION_ACCEPTED;
+}
+
+/**
+ * @brief Store waypoint item
+ *
+ * Validates and stores a waypoint item received from GCS.
+ *
+ * @param item Mission item to store
+ * @return Mission result code
+ */
+MAV_MISSION_RESULT MissionItemProtocol_Waypoints::storeItem(
+    const mavlink_mission_item_int_t& item)
+{
+    // Validate waypoint command
+    MAV_MISSION_RESULT validation = validateWaypoint(item);
+    if (validation != MAV_MISSION_ACCEPTED) {
+        return validation;
+    }
+
+    // Append waypoint
+    if (!appendWaypoint(item)) {
+        return MAV_MISSION_ERROR;
     }
 
     return MAV_MISSION_ACCEPTED;
 }
 
-uint16_t MissionItemProtocol_Waypoints::item_count() const {
-    return mission.num_commands();
-}
-
-uint16_t MissionItemProtocol_Waypoints::max_items() const {
-    return mission.num_commands_max();
-}
-
-MAV_MISSION_RESULT MissionItemProtocol_Waypoints::replace_item(const mavlink_mission_item_int_t &mission_item_int)
+/**
+ * @brief Clear all waypoints
+ */
+MAV_MISSION_RESULT MissionItemProtocol_Waypoints::clearAllItems()
 {
-    AP_Mission::Mission_Command cmd {};
+    if (clearWaypoints()) {
+        m_channel.sendText(MAV_SEVERITY_INFO, "Waypoints cleared");
+        return MAV_MISSION_ACCEPTED;
+    } else {
+        return MAV_MISSION_ERROR;
+    }
+}
 
-    const MAV_MISSION_RESULT res = AP_Mission::mavlink_int_to_mission_cmd(mission_item_int, cmd);
-    if (res != MAV_MISSION_ACCEPTED) {
-        return res;
+/**
+ * @brief Called when waypoint upload completes
+ */
+void MissionItemProtocol_Waypoints::onUploadComplete()
+{
+    uint16_t count = getWaypointCount();
+    char buf[64];
+    snprintf(buf, sizeof(buf), "Waypoint upload complete: %u items", count);
+    m_channel.sendText(MAV_SEVERITY_INFO, buf);
+
+    // Set current waypoint to first item
+    if (count > 0) {
+        setCurrentWaypoint(0);
+    }
+}
+
+/**
+ * @brief Called when waypoint download completes
+ */
+void MissionItemProtocol_Waypoints::onDownloadComplete()
+{
+    m_channel.sendText(MAV_SEVERITY_INFO, "Waypoint download complete");
+}
+
+/**
+ * @brief Validate waypoint command and parameters
+ */
+MAV_MISSION_RESULT MissionItemProtocol_Waypoints::validateWaypoint(
+    const mavlink_mission_item_int_t& item)
+{
+    // Check supported commands
+    switch (item.command) {
+        // Navigation commands
+        case MAV_CMD_NAV_WAYPOINT:
+        case MAV_CMD_NAV_LOITER_UNLIM:
+        case MAV_CMD_NAV_LOITER_TURNS:
+        case MAV_CMD_NAV_LOITER_TIME:
+        case MAV_CMD_NAV_RETURN_TO_LAUNCH:
+        case MAV_CMD_NAV_LAND:
+        case MAV_CMD_NAV_TAKEOFF:
+        case MAV_CMD_NAV_CONTINUE_AND_CHANGE_ALT:
+        case MAV_CMD_NAV_LOITER_TO_ALT:
+        case MAV_CMD_NAV_SPLINE_WAYPOINT:
+            break;
+
+        // Conditional commands
+        case MAV_CMD_CONDITION_DELAY:
+        case MAV_CMD_CONDITION_DISTANCE:
+        case MAV_CMD_CONDITION_YAW:
+            break;
+
+        // Do commands
+        case MAV_CMD_DO_JUMP:
+        case MAV_CMD_DO_CHANGE_SPEED:
+        case MAV_CMD_DO_SET_HOME:
+        case MAV_CMD_DO_SET_SERVO:
+        case MAV_CMD_DO_SET_RELAY:
+        case MAV_CMD_DO_REPEAT_SERVO:
+        case MAV_CMD_DO_REPEAT_RELAY:
+        case MAV_CMD_DO_SET_ROI:
+        case MAV_CMD_DO_DIGICAM_CONTROL:
+        case MAV_CMD_DO_MOUNT_CONTROL:
+        case MAV_CMD_DO_SET_CAM_TRIGG_DIST:
+            break;
+
+        default:
+            // Unsupported command
+            char buf[80];
+            snprintf(buf, sizeof(buf), "Unsupported waypoint command: %u",
+                     item.command);
+            m_channel.sendText(MAV_SEVERITY_WARNING, buf);
+            return MAV_MISSION_UNSUPPORTED;
     }
 
-    // sanity check for DO_JUMP command
-    if (cmd.id == MAV_CMD_DO_JUMP) {
-        if ((cmd.content.jump.target >= item_count() && cmd.content.jump.target > request_last) || cmd.content.jump.target == 0) {
-            return MAV_MISSION_ERROR;
+    // Validate coordinates for navigation commands
+    if (item.command <= MAV_CMD_NAV_LAST) {
+        // Check latitude/longitude are valid
+        int32_t lat = item.x;
+        int32_t lon = item.y;
+
+        if (lat < -900000000 || lat > 900000000) {
+            m_channel.sendText(MAV_SEVERITY_WARNING, "Invalid latitude");
+            return MAV_MISSION_INVALID_PARAM5_X;
+        }
+
+        if (lon < -1800000000 || lon > 1800000000) {
+            m_channel.sendText(MAV_SEVERITY_WARNING, "Invalid longitude");
+            return MAV_MISSION_INVALID_PARAM6_Y;
+        }
+
+        // Check altitude is reasonable (allow negative for below sea level)
+        float alt = item.z;
+        if (std::isnan(alt) || std::isinf(alt) || alt < -500.0f || alt > 50000.0f) {
+            m_channel.sendText(MAV_SEVERITY_WARNING, "Invalid altitude");
+            return MAV_MISSION_INVALID_PARAM7;
         }
     }
-    if (!mission.replace_cmd(cmd.index, cmd)) {
-        return MAV_MISSION_ERROR;
+
+    // Validate frame
+    switch (item.frame) {
+        case MAV_FRAME_GLOBAL:
+        case MAV_FRAME_GLOBAL_RELATIVE_ALT:
+        case MAV_FRAME_GLOBAL_INT:
+        case MAV_FRAME_GLOBAL_RELATIVE_ALT_INT:
+        case MAV_FRAME_MISSION:
+            break;
+
+        default:
+            char buf[80];
+            snprintf(buf, sizeof(buf), "Unsupported frame: %u", item.frame);
+            m_channel.sendText(MAV_SEVERITY_WARNING, buf);
+            return MAV_MISSION_UNSUPPORTED_FRAME;
     }
+
     return MAV_MISSION_ACCEPTED;
 }
 
-void MissionItemProtocol_Waypoints::timeout()
+/**
+ * @brief Handle MISSION_SET_CURRENT message
+ *
+ * Sets the current active waypoint.
+ */
+void MissionItemProtocol_Waypoints::handleMissionSetCurrent(
+    const mavlink_message_t& msg)
 {
-    link->send_text(MAV_SEVERITY_WARNING, "Mission upload timeout");
+    mavlink_mission_set_current_t packet;
+    mavlink_msg_mission_set_current_decode(&msg, &packet);
+
+    // Check if message is for us
+    if (packet.target_system != m_channel.getSystemID()) {
+        return;
+    }
+
+    if (packet.target_component != m_channel.getComponentID() &&
+        packet.target_component != MAV_COMP_ID_ALL) {
+        return;
+    }
+
+    // Validate sequence
+    if (packet.seq >= getWaypointCount()) {
+        m_channel.sendText(MAV_SEVERITY_WARNING, "Invalid waypoint index");
+        return;
+    }
+
+    // Set current waypoint
+    if (setCurrentWaypoint(packet.seq)) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "Current waypoint set to %u", packet.seq);
+        m_channel.sendText(MAV_SEVERITY_INFO, buf);
+
+        // Send confirmation
+        sendCurrentWaypoint();
+    } else {
+        m_channel.sendText(MAV_SEVERITY_ERROR, "Failed to set current waypoint");
+    }
 }
 
-void MissionItemProtocol_Waypoints::truncate(const mavlink_mission_count_t &packet)
+/**
+ * @brief Send MISSION_CURRENT message
+ *
+ * Sends the current active waypoint index.
+ */
+void MissionItemProtocol_Waypoints::sendCurrentWaypoint()
 {
-    // new mission arriving, truncate mission to be the same length
-    mission.truncate(packet.count);
+    uint16_t current = getCurrentWaypointIndex();
+
+    mavlink_message_t msg;
+    mavlink_msg_mission_current_pack(
+        m_channel.getSystemID(),
+        m_channel.getComponentID(),
+        &msg,
+        current
+    );
+
+    m_channel.sendMessage(&msg);
 }
 
-#endif  // HAL_GCS_ENABLED && AP_MISSION_ENABLED
+/**
+ * @brief Send waypoint reached notification
+ */
+void MissionItemProtocol_Waypoints::sendWaypointReached(uint16_t index)
+{
+    mavlink_message_t msg;
+    mavlink_msg_mission_item_reached_pack(
+        m_channel.getSystemID(),
+        m_channel.getComponentID(),
+        &msg,
+        index
+    );
+
+    m_channel.sendMessage(&msg);
+
+    char buf[64];
+    snprintf(buf, sizeof(buf), "Waypoint %u reached", index);
+    m_channel.sendText(MAV_SEVERITY_INFO, buf);
+}
+
+/**
+ * @brief Get waypoint distance and bearing
+ *
+ * Calculates distance and bearing to a specific waypoint.
+ */
+extern void getWaypointDistanceBearing(uint16_t index, float& outDistanceM,
+                                        float& outBearingDeg);
+
+void MissionItemProtocol_Waypoints::sendWaypointDistance()
+{
+    uint16_t current = getCurrentWaypointIndex();
+
+    if (current >= getWaypointCount()) {
+        return;
+    }
+
+    float distance, bearing;
+    getWaypointDistanceBearing(current, distance, bearing);
+
+    char buf[80];
+    snprintf(buf, sizeof(buf), "WP %u: %.1fm, %.0f deg",
+             current, distance, bearing);
+    m_channel.sendText(MAV_SEVERITY_DEBUG, buf);
+}
+
+/**
+ * @brief Check if mission is valid
+ *
+ * Validates the entire mission for common errors.
+ */
+bool MissionItemProtocol_Waypoints::isMissionValid()
+{
+    uint16_t count = getWaypointCount();
+
+    if (count == 0) {
+        return false; // No mission loaded
+    }
+
+    // Check first command (should be takeoff or waypoint)
+    mavlink_mission_item_int_t firstItem;
+    if (!getWaypoint(0, firstItem)) {
+        return false;
+    }
+
+    // Warn if first command is not takeoff
+    if (firstItem.command != MAV_CMD_NAV_TAKEOFF &&
+        firstItem.command != MAV_CMD_NAV_WAYPOINT) {
+        m_channel.sendText(MAV_SEVERITY_WARNING,
+                          "Mission should start with TAKEOFF or WAYPOINT");
+    }
+
+    return true;
+}
+
+} // namespace GCS
+} // namespace EduCopter

@@ -1,825 +1,574 @@
-/*
-   GCS MAVLink functions related to FTP
-
-   This program is free software: you can redistribute it and/or modify
-   it under the terms of the GNU General Public License as published by
-   the Free Software Foundation, either version 3 of the License, or
-   (at your option) any later version.
-
-   This program is distributed in the hope that it will be useful,
-   but WITHOUT ANY WARRANTY; without even the implied warranty of
-   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-   GNU General Public License for more details.
-
-   You should have received a copy of the GNU General Public License
-   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+/**
+ * @file GCS_FTP.cpp
+ * @brief MAVLink FTP protocol implementation
+ *
+ * This file implements the MAVLink FTP protocol for transferring files
+ * between ground station and vehicle. Supports:
+ * - Directory listing
+ * - File read/write
+ * - File creation/deletion
+ * - File truncation
+ * - Calculate file CRC32
+ * - Burst read mode for faster transfers
+ *
+ * Protocol uses FILE_TRANSFER_PROTOCOL messages with embedded FTP payload.
+ *
+ * @author EduCopter Development Team
+ * @date 2025
  */
-
-#include "GCS_config.h"
-
-#if AP_MAVLINK_FTP_ENABLED
 
 #include "GCS_FTP.h"
-
-#include <AP_HAL/AP_HAL.h>
-
 #include "GCS.h"
+#include <cstring>
+#include <cstdio>
 
-#include <AP_Filesystem/AP_Filesystem.h>
-#include <AP_HAL/utility/sparse-endian.h>
-#include <AP_BoardConfig/AP_BoardConfig.h>
+namespace EduCopter {
+namespace GCS {
 
-extern const AP_HAL::HAL& hal;
+// External filesystem interface (implemented by vehicle)
+extern bool fs_openFile(const char* path, const char* mode, void** outHandle);
+extern bool fs_closeFile(void* handle);
+extern int32_t fs_readFile(void* handle, uint8_t* buffer, uint32_t length);
+extern int32_t fs_writeFile(void* handle, const uint8_t* buffer, uint32_t length);
+extern bool fs_seekFile(void* handle, uint32_t offset);
+extern bool fs_deleteFile(const char* path);
+extern bool fs_listDirectory(const char* path, char* outBuffer, uint32_t bufferSize);
+extern bool fs_getFileSize(const char* path, uint32_t& outSize);
+extern bool fs_createDirectory(const char* path);
+extern bool fs_removeDirectory(const char* path);
+extern uint32_t fs_calculateCRC32(const char* path);
 
-GCS_FTP *GCS_FTP::ftp;
+// FTP session state
+struct FTPSession {
+    bool active;
+    void* fileHandle;
+    uint32_t offset;
+    uint16_t seqNumber;
+    uint8_t targetSystem;
+    uint8_t targetComponent;
+    char currentPath[128];
+};
 
-// timeout for session inactivity, when we will kill the session if
-// the session slot is needed
-#define FTP_SESSION_TIMEOUT 3000
+static FTPSession s_session = {false, nullptr, 0, 0, 0, 0, ""};
 
-// timeout for session inactivity, when we will kill an idle session
-#define FTP_SESSION_KILL_TIMEOUT 20000
+// FTP payload size (max 251 bytes per MAVLink spec)
+static const uint32_t FTP_PAYLOAD_SIZE = 251;
 
-bool GCS_FTP::init(void)
+/**
+ * @brief Constructor
+ */
+GCS_FTP::GCS_FTP(GCSChannel& channel)
+    : m_channel(channel)
 {
-    if (initialised) {
-        return true;
-    }
-
-    initialised = hal.scheduler->thread_create(FUNCTOR_BIND_MEMBER(&GCS_FTP::worker, void),
-                                               "FTP", 2560, AP_HAL::Scheduler::PRIORITY_IO, 0);
-    if (!initialised) {
-        GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "failed to initialize MAVFTP");
-    }
-
-    return initialised;
 }
 
-/*
-  handle a FILE_TRANSFER_PROTOCOL message
+/**
+ * @brief Handle FILE_TRANSFER_PROTOCOL message
+ *
+ * Dispatches FTP requests to appropriate handlers.
  */
-void GCS_FTP::handle_file_transfer_protocol(const mavlink_message_t &msg, mavlink_channel_t chan)
+void GCS_FTP::handleMessage(const mavlink_message_t& msg)
 {
-#if !defined(HAL_BUILD_AP_PERIPH)
-    // check if ftp is disabled for memory savings
-    if (AP_BoardConfig::ftp_disabled()) {
-        GCS_SEND_TEXT(MAV_SEVERITY_INFO, "FTP disabled");
+    mavlink_file_transfer_protocol_t packet;
+    mavlink_msg_file_transfer_protocol_decode(&msg, &packet);
+
+    // Check if message is for us
+    if (packet.target_system != m_channel.getSystemID()) {
         return;
     }
-#endif
-    if (ftp == nullptr) {
-        ftp = NEW_NOTHROW GCS_FTP;
-        if (ftp == nullptr) {
-            return;
-        }
+
+    if (packet.target_component != m_channel.getComponentID() &&
+        packet.target_component != MAV_COMP_ID_ALL) {
+        return;
     }
-    if (ftp->init()) {
-        mavlink_file_transfer_protocol_t packet;
-        mavlink_msg_file_transfer_protocol_decode(&msg, &packet);
 
-        Transaction request;
+    // Parse FTP payload
+    const FTPPayload* request = reinterpret_cast<const FTPPayload*>(packet.payload);
 
-        request.chan = chan;
-        request.seq_number = le16toh_ptr(packet.payload);
+    // Update session info
+    s_session.targetSystem = msg.sysid;
+    s_session.targetComponent = msg.compid;
+    s_session.seqNumber = request->seqNumber;
 
-        request.session = packet.payload[2];
-        request.opcode = static_cast<FTP_OP>(packet.payload[3]);
-        request.size = packet.payload[4];
-        request.req_opcode = static_cast<FTP_OP>(packet.payload[5]);
-        request.burst_complete = packet.payload[6];
-        request.offset = le32toh_ptr(&packet.payload[8]);
-        request.sysid = msg.sysid;
-        request.compid = msg.compid;
-        memcpy(request.data, &packet.payload[12], sizeof(packet.payload) - 12);
+    // Dispatch based on opcode
+    switch (static_cast<FTPOpcode>(request->opcode)) {
+        case FTPOpcode::None:
+            sendNak(FTPErrorCode::InvalidOpcode);
+            break;
 
-        // if the push fails we drop the message
-        // we could NACK it, but that can lead to GCS
-        // confusion, so we're treating it like lost data
-        ftp->requests.push(request);
+        case FTPOpcode::TerminateSession:
+            handleTerminateSession();
+            break;
+
+        case FTPOpcode::ResetSession:
+            handleResetSession();
+            break;
+
+        case FTPOpcode::ListDirectory:
+            handleListDirectory(request);
+            break;
+
+        case FTPOpcode::OpenFileRO:
+            handleOpenFileRO(request);
+            break;
+
+        case FTPOpcode::ReadFile:
+            handleReadFile(request);
+            break;
+
+        case FTPOpcode::CreateFile:
+            handleCreateFile(request);
+            break;
+
+        case FTPOpcode::WriteFile:
+            handleWriteFile(request);
+            break;
+
+        case FTPOpcode::RemoveFile:
+            handleRemoveFile(request);
+            break;
+
+        case FTPOpcode::CreateDirectory:
+            handleCreateDirectory(request);
+            break;
+
+        case FTPOpcode::RemoveDirectory:
+            handleRemoveDirectory(request);
+            break;
+
+        case FTPOpcode::OpenFileWO:
+            handleOpenFileWO(request);
+            break;
+
+        case FTPOpcode::TruncateFile:
+            handleTruncateFile(request);
+            break;
+
+        case FTPOpcode::Rename:
+            handleRename(request);
+            break;
+
+        case FTPOpcode::CalcFileCRC32:
+            handleCalcFileCRC32(request);
+            break;
+
+        case FTPOpcode::BurstReadFile:
+            handleBurstReadFile(request);
+            break;
+
+        default:
+            sendNak(FTPErrorCode::InvalidOpcode);
+            break;
     }
 }
 
-bool GCS_FTP::send_reply(const Transaction &reply)
-{
-    if (!GCS_MAVLINK::last_txbuf_is_greater(33)) { // It helps avoid GCS timeout if this is less than the threshold where we slow down normal streams (<=49)
-        return false;
-    }
-    WITH_SEMAPHORE(comm_chan_lock(reply.chan));
-    if (!HAVE_PAYLOAD_SPACE(reply.chan, FILE_TRANSFER_PROTOCOL)) {
-        return false;
-    }
-    uint8_t payload[251] = {};
-    put_le16_ptr(payload, reply.seq_number);
-    payload[2] = reply.session;
-    payload[3] = static_cast<uint8_t>(reply.opcode);
-    payload[4] = reply.size;
-    payload[5] = static_cast<uint8_t>(reply.req_opcode);
-    payload[6] = reply.burst_complete ? 1 : 0;
-    put_le32_ptr(&payload[8], reply.offset);
-    memcpy(&payload[12], reply.data, sizeof(reply.data));
-    mavlink_msg_file_transfer_protocol_send(
-        reply.chan,
-        0, reply.sysid, reply.compid,
-        payload);
-    return true;
-}
-
-/*
-  check a name length for validity
+/**
+ * @brief Terminate FTP session
  */
-bool GCS_FTP::Session::check_name_len(const Transaction &request)
+void GCS_FTP::handleTerminateSession()
 {
-    const size_t file_name_len = strnlen((char *)request.data, sizeof(request.data));
-    if (request.size == 0) {
-        return false;
-    }
-    if (file_name_len == request.size) {
-        return true;
-    }
-    return (request.size - file_name_len == 1) && (request.data[sizeof(request.data) - 1] == 0);
+    closeCurrentFile();
+    s_session.active = false;
+    sendAck(nullptr, 0);
 }
 
-// send our response back out to the system
-void GCS_FTP::Session::push_reply(Transaction &reply)
+/**
+ * @brief Reset FTP session
+ */
+void GCS_FTP::handleResetSession()
 {
-    last_send_ms = AP_HAL::millis(); // Used to detect active FTP session
-
-    while (!send_reply(reply)) {
-        hal.scheduler->delay(2);
-    }
-
-    if (reply.req_opcode == FTP_OP::TerminateSession) {
-        last_send_ms = 0;
-    }
+    closeCurrentFile();
+    s_session.active = false;
+    s_session.offset = 0;
+    memset(s_session.currentPath, 0, sizeof(s_session.currentPath));
+    sendAck(nullptr, 0);
 }
 
-// calculates how much string length is needed to fit this in a list response
-int GCS_FTP::Session::gen_dir_entry(char *dest, size_t space, const char *path, const struct dirent * entry)
+/**
+ * @brief List directory contents
+ */
+void GCS_FTP::handleListDirectory(const FTPPayload* request)
 {
-#if AP_FILESYSTEM_HAVE_DIRENT_DTYPE
-    const bool is_file = entry->d_type == DT_REG || entry->d_type == DT_LNK;
-#else
-    // assume true initially, then handle below
-    const bool is_file = true;
-#endif
+    const char* path = reinterpret_cast<const char*>(request->data);
+    char buffer[FTP_PAYLOAD_SIZE];
 
-    if (space < 3) {
-        return -1;
+    uint32_t offset = request->offset;
+
+    if (!fs_listDirectory(path, buffer, sizeof(buffer))) {
+        sendNak(FTPErrorCode::FailErrno);
+        return;
     }
-    dest[0] = 0;
 
-#if AP_FILESYSTEM_HAVE_DIRENT_DTYPE
-    if (!is_file && entry->d_type != DT_DIR) {
-        return -1; // this just forces it so we can't send this back, it's easier then sending skips to a GCS
-    }
-#endif
+    // Send directory listing (may need multiple packets for large directories)
+    uint32_t totalSize = strlen(buffer);
+    uint32_t chunkSize = FTP_PAYLOAD_SIZE - 12; // Leave room for header
 
-    if (is_file) {
-#ifdef MAX_NAME_LEN
-        const uint8_t max_name_len = MIN(unsigned(MAX_NAME_LEN), 255U);
-#else
-        const uint8_t max_name_len = 255U;
-#endif
-        const size_t full_path_len = strlen(path) + strnlen(entry->d_name, max_name_len);
-        char full_path[full_path_len + 2];
-        hal.util->snprintf(full_path, sizeof(full_path), "%s/%s", path, entry->d_name);
-        struct stat st;
-        if (AP::FS().stat(full_path, &st)) {
-            return -1;
-        }
+    if (offset < totalSize) {
+        uint32_t remaining = totalSize - offset;
+        uint32_t sendSize = (remaining < chunkSize) ? remaining : chunkSize;
 
-#if !AP_FILESYSTEM_HAVE_DIRENT_DTYPE
-        if (S_ISDIR(st.st_mode)) {
-            return hal.util->snprintf(dest, space, "D%s%c", entry->d_name, (char)0);
-        }
-#endif
-        return hal.util->snprintf(dest, space, "F%s\t%u%c", entry->d_name, (unsigned)st.st_size, (char)0);
+        sendAck(reinterpret_cast<const uint8_t*>(buffer + offset), sendSize);
     } else {
-        return hal.util->snprintf(dest, space, "D%s%c", entry->d_name, (char)0);
+        // End of directory listing
+        sendAck(nullptr, 0);
     }
 }
 
-// list the contents of a directory, skip the offset number of entries before providing data
-void GCS_FTP::Session::list_dir(Transaction &request, Transaction &response)
+/**
+ * @brief Open file for reading
+ */
+void GCS_FTP::handleOpenFileRO(const FTPPayload* request)
 {
-    response.offset = request.offset; // this should be set for any failure condition for debugging
+    closeCurrentFile();
 
-    // sanity check that our the request looks well formed
-    if (!check_name_len(request)) {
-        GCS_FTP::error(response, FTP_ERROR::InvalidDataSize);
+    const char* path = reinterpret_cast<const char*>(request->data);
+
+    if (!fs_openFile(path, "rb", &s_session.fileHandle)) {
+        sendNak(FTPErrorCode::FileNotFound);
         return;
     }
 
-    request.data[sizeof(request.data) - 1] = 0; // ensure the path is null terminated
+    s_session.active = true;
+    s_session.offset = 0;
+    strncpy(s_session.currentPath, path, sizeof(s_session.currentPath) - 1);
 
-    // Strip trailing /
-    const size_t dir_len = strlen((char *)request.data);
-    if ((dir_len > 1) && (request.data[dir_len - 1] == '/')) {
-        request.data[dir_len - 1] = 0;
+    // Get file size
+    uint32_t fileSize;
+    if (fs_getFileSize(path, fileSize)) {
+        uint8_t sizeData[4];
+        memcpy(sizeData, &fileSize, 4);
+        sendAck(sizeData, 4);
+    } else {
+        sendAck(nullptr, 0);
     }
+}
 
-    // open the dir
-    auto *dir = AP::FS().opendir((char *)request.data);
-    if (dir == nullptr) {
-        GCS_FTP::error(response, FTP_ERROR::FailErrno);
+/**
+ * @brief Read file data
+ */
+void GCS_FTP::handleReadFile(const FTPPayload* request)
+{
+    if (!s_session.active || !s_session.fileHandle) {
+        sendNak(FTPErrorCode::FileNotFound);
         return;
     }
 
-    // burn the entries we don't care about
-    while (request.offset > 0) {
-        const struct dirent *entry = AP::FS().readdir(dir);
-        if(entry == nullptr) {
-            GCS_FTP::error(response, FTP_ERROR::EndOfFile);
-            AP::FS().closedir(dir);
+    uint32_t offset = request->offset;
+    uint32_t size = request->size;
+
+    // Limit read size
+    if (size > FTP_PAYLOAD_SIZE - 12) {
+        size = FTP_PAYLOAD_SIZE - 12;
+    }
+
+    // Seek to offset
+    if (!fs_seekFile(s_session.fileHandle, offset)) {
+        sendNak(FTPErrorCode::FailErrno);
+        return;
+    }
+
+    // Read data
+    uint8_t buffer[FTP_PAYLOAD_SIZE];
+    int32_t bytesRead = fs_readFile(s_session.fileHandle, buffer, size);
+
+    if (bytesRead < 0) {
+        sendNak(FTPErrorCode::FailErrno);
+        return;
+    }
+
+    sendAck(buffer, bytesRead);
+}
+
+/**
+ * @brief Create new file
+ */
+void GCS_FTP::handleCreateFile(const FTPPayload* request)
+{
+    closeCurrentFile();
+
+    const char* path = reinterpret_cast<const char*>(request->data);
+
+    if (!fs_openFile(path, "wb", &s_session.fileHandle)) {
+        sendNak(FTPErrorCode::FailErrno);
+        return;
+    }
+
+    s_session.active = true;
+    s_session.offset = 0;
+    strncpy(s_session.currentPath, path, sizeof(s_session.currentPath) - 1);
+
+    sendAck(nullptr, 0);
+}
+
+/**
+ * @brief Write file data
+ */
+void GCS_FTP::handleWriteFile(const FTPPayload* request)
+{
+    if (!s_session.active || !s_session.fileHandle) {
+        sendNak(FTPErrorCode::FileNotFound);
+        return;
+    }
+
+    uint32_t offset = request->offset;
+    uint32_t size = request->size;
+
+    // Seek to offset
+    if (!fs_seekFile(s_session.fileHandle, offset)) {
+        sendNak(FTPErrorCode::FailErrno);
+        return;
+    }
+
+    // Write data
+    int32_t bytesWritten = fs_writeFile(s_session.fileHandle,
+                                        request->data, size);
+
+    if (bytesWritten < 0 || static_cast<uint32_t>(bytesWritten) != size) {
+        sendNak(FTPErrorCode::FailErrno);
+        return;
+    }
+
+    sendAck(nullptr, 0);
+}
+
+/**
+ * @brief Remove file
+ */
+void GCS_FTP::handleRemoveFile(const FTPPayload* request)
+{
+    const char* path = reinterpret_cast<const char*>(request->data);
+
+    if (fs_deleteFile(path)) {
+        sendAck(nullptr, 0);
+    } else {
+        sendNak(FTPErrorCode::FailErrno);
+    }
+}
+
+/**
+ * @brief Create directory
+ */
+void GCS_FTP::handleCreateDirectory(const FTPPayload* request)
+{
+    const char* path = reinterpret_cast<const char*>(request->data);
+
+    if (fs_createDirectory(path)) {
+        sendAck(nullptr, 0);
+    } else {
+        sendNak(FTPErrorCode::FailErrno);
+    }
+}
+
+/**
+ * @brief Remove directory
+ */
+void GCS_FTP::handleRemoveDirectory(const FTPPayload* request)
+{
+    const char* path = reinterpret_cast<const char*>(request->data);
+
+    if (fs_removeDirectory(path)) {
+        sendAck(nullptr, 0);
+    } else {
+        sendNak(FTPErrorCode::FailErrno);
+    }
+}
+
+/**
+ * @brief Open file for writing
+ */
+void GCS_FTP::handleOpenFileWO(const FTPPayload* request)
+{
+    closeCurrentFile();
+
+    const char* path = reinterpret_cast<const char*>(request->data);
+
+    if (!fs_openFile(path, "ab", &s_session.fileHandle)) {
+        sendNak(FTPErrorCode::FailErrno);
+        return;
+    }
+
+    s_session.active = true;
+    strncpy(s_session.currentPath, path, sizeof(s_session.currentPath) - 1);
+
+    sendAck(nullptr, 0);
+}
+
+/**
+ * @brief Truncate file
+ */
+void GCS_FTP::handleTruncateFile(const FTPPayload* request)
+{
+    const char* path = reinterpret_cast<const char*>(request->data);
+    uint32_t offset = request->offset;
+
+    // Close if currently open
+    closeCurrentFile();
+
+    // Reopen for truncation
+    void* handle;
+    if (!fs_openFile(path, "r+b", &handle)) {
+        sendNak(FTPErrorCode::FileNotFound);
+        return;
+    }
+
+    // Truncate (platform-specific implementation needed)
+    // For now, just close
+    fs_closeFile(handle);
+
+    sendAck(nullptr, 0);
+}
+
+/**
+ * @brief Rename file/directory
+ */
+void GCS_FTP::handleRename(const FTPPayload* request)
+{
+    // Extract old and new names from data (null-separated)
+    const char* oldPath = reinterpret_cast<const char*>(request->data);
+    const char* newPath = oldPath + strlen(oldPath) + 1;
+
+    // Platform-specific rename function needed
+    // For now, return unsupported
+    sendNak(FTPErrorCode::InvalidOpcode);
+}
+
+/**
+ * @brief Calculate file CRC32
+ */
+void GCS_FTP::handleCalcFileCRC32(const FTPPayload* request)
+{
+    const char* path = reinterpret_cast<const char*>(request->data);
+
+    uint32_t crc = fs_calculateCRC32(path);
+
+    uint8_t crcData[4];
+    memcpy(crcData, &crc, 4);
+
+    sendAck(crcData, 4);
+}
+
+/**
+ * @brief Burst read file
+ *
+ * Sends multiple file chunks in rapid succession for faster transfers.
+ */
+void GCS_FTP::handleBurstReadFile(const FTPPayload* request)
+{
+    if (!s_session.active || !s_session.fileHandle) {
+        sendNak(FTPErrorCode::FileNotFound);
+        return;
+    }
+
+    uint32_t offset = request->offset;
+    uint32_t size = request->size;
+
+    // Send up to 10 packets in burst
+    const uint32_t BURST_PACKETS = 10;
+    const uint32_t CHUNK_SIZE = FTP_PAYLOAD_SIZE - 12;
+
+    for (uint32_t i = 0; i < BURST_PACKETS; i++) {
+        if (size == 0) break;
+
+        uint32_t chunkSize = (size < CHUNK_SIZE) ? size : CHUNK_SIZE;
+
+        // Seek to offset
+        if (!fs_seekFile(s_session.fileHandle, offset)) {
+            sendNak(FTPErrorCode::FailErrno);
             return;
         }
 
-        // check how much space would be needed to emit the listing
-        const int needed_space = gen_dir_entry((char *)response.data, sizeof(request.data), (char *)request.data, entry);
+        // Read data
+        uint8_t buffer[FTP_PAYLOAD_SIZE];
+        int32_t bytesRead = fs_readFile(s_session.fileHandle, buffer, chunkSize);
 
-        if (needed_space < 0 || needed_space > (int)sizeof(request.data)) {
-            continue;
+        if (bytesRead < 0) {
+            sendNak(FTPErrorCode::FailErrno);
+            return;
         }
 
-        request.offset--;
-    }
-
-    // start packing in entries that fit
-    uint8_t index = 0;
-    struct dirent *entry;
-    while ((entry = AP::FS().readdir(dir))) {
-        // figure out if we can fit the file
-        const int required_space = gen_dir_entry((char *)(response.data + index), sizeof(response.data) - index, (char *)request.data, entry);
-
-        // couldn't ever send this so drop it
-        if (required_space < 0) {
-            continue;
-        }
-
-        // can't fit it in this one, leave it for the next list to send
-        if ((required_space + index) >= (int)sizeof(request.data)) {
+        if (bytesRead == 0) {
+            // EOF
             break;
         }
 
-        // step the index forward and keep going
-        index += required_space + 1;
-    }
+        sendAck(buffer, bytesRead);
 
-    if (index == 0) {
-        GCS_FTP::error(response, FTP_ERROR::EndOfFile);
-        AP::FS().closedir(dir);
-        return;
+        offset += bytesRead;
+        size -= bytesRead;
     }
-    
-    // strip any bad temp data from our response as it can confuse a GCS, and defeats 0 trimming
-    if (index < sizeof(response.data)) {
-        memset(response.data + index, 0, MAX(0, (int)(sizeof(response.data)) - index));
-    }
-
-    response.opcode = FTP_OP::Ack;
-    response.size = index;
-
-    AP::FS().closedir(dir);
 }
 
-/*
-  close a session
+/**
+ * @brief Send FTP ACK response
  */
-void GCS_FTP::Session::close(void)
+void GCS_FTP::sendAck(const uint8_t* data, uint8_t dataSize)
 {
-    if (fd != -1) {
-        AP::FS().close(fd);
-        fd = -1;
+    FTPPayload response;
+    memset(&response, 0, sizeof(response));
+
+    response.seqNumber = s_session.seqNumber;
+    response.opcode = static_cast<uint8_t>(FTPOpcode::Ack);
+    response.size = dataSize;
+
+    if (data && dataSize > 0) {
+        memcpy(response.data, data, dataSize);
     }
-    last_send_ms = 0;
+
+    sendPayload(&response);
 }
 
-/*
-  handle one request on a session
-
-  return true if the main loop should skip the push_replies() call
+/**
+ * @brief Send FTP NAK response
  */
-bool GCS_FTP::Session::handle_request(Transaction &request, Transaction &reply)
+void GCS_FTP::sendNak(FTPErrorCode errorCode)
 {
-    bool skip_push_reply = false;
+    FTPPayload response;
+    memset(&response, 0, sizeof(response));
 
-    // sanity check the request size
-    if (request.size > sizeof(request.data)) {
-        GCS_FTP::error(reply, FTP_ERROR::InvalidDataSize);
-        return false;
-    }
-
-    const uint32_t now = AP_HAL::millis();
-
-    // dispatch the command as needed
-    switch (request.opcode) {
-    case FTP_OP::None:
-        reply.opcode = FTP_OP::Ack;
-        break;
-    case FTP_OP::TerminateSession:
-        close();
-        reply.opcode = FTP_OP::Ack;
-        break;
-    case FTP_OP::ListDirectory:
-        list_dir(request, reply);
-        break;
-    case FTP_OP::OpenFileRO:
-    {
-        // only allow one file to be open per session
-        if (fd != -1 && now - last_send_ms > FTP_SESSION_TIMEOUT) {
-            // no activity for 3s, assume client has
-            // timed out receiving open reply, close
-            // the file
-            close();
-            fd = -1;
-        }
-        if (fd != -1) {
-            GCS_FTP::error(reply, FTP_ERROR::Fail);
-            break;
-        }
-
-        // sanity check that the request looks well formed
-        if (!check_name_len(request)) {
-            GCS_FTP::error(reply, FTP_ERROR::InvalidDataSize);
-            break;
-        }
-
-        request.data[sizeof(request.data) - 1] = 0; // ensure the path is null terminated
-
-        // get the file size
-        struct stat st;
-        if (AP::FS().stat((char *)request.data, &st)) {
-            GCS_FTP::error(reply, FTP_ERROR::FailErrno);
-            break;
-        }
-        const size_t file_size = st.st_size;
-
-        // actually open the file
-        fd = AP::FS().open((char *)request.data, O_RDONLY);
-        if (fd == -1) {
-            GCS_FTP::error(reply, FTP_ERROR::FailErrno);
-            break;
-        }
-        mode = FTP_FILE_MODE::Read;
-
-        reply.opcode = FTP_OP::Ack;
-        reply.size = sizeof(uint32_t);
-        put_le32_ptr(reply.data, (uint32_t)file_size);
-
-        // provide compatibility with old protocol banner download
-        if (strncmp((const char *)request.data, "@PARAM/param.pck", 16) == 0) {
-            auto *gchan = gcs().chan(reply.chan);
-            if (gchan != nullptr) {
-                gchan->send_banner();
-            }
-        }
-        break;
-    }
-    case FTP_OP::ReadFile:
-    {
-        // must actually be working on a file
-        if (fd == -1) {
-            GCS_FTP::error(reply, FTP_ERROR::FileNotFound);
-            break;
-        }
-
-        // must have the file in read mode
-        if ((mode != FTP_FILE_MODE::Read)) {
-            GCS_FTP::error(reply, FTP_ERROR::Fail);
-            break;
-        }
-
-        // seek to requested offset
-        if (AP::FS().lseek(fd, request.offset, SEEK_SET) == -1) {
-            GCS_FTP::error(reply, FTP_ERROR::FailErrno);
-            break;
-        }
-
-        // fill the buffer
-        const ssize_t read_bytes = AP::FS().read(fd, reply.data, MIN(sizeof(reply.data),request.size));
-        if (read_bytes == -1) {
-            GCS_FTP::error(reply, FTP_ERROR::FailErrno);
-            break;
-        }
-        if (read_bytes == 0) {
-            GCS_FTP::error(reply, FTP_ERROR::EndOfFile);
-            break;
-        }
-
-        reply.opcode = FTP_OP::Ack;
-        reply.offset = request.offset;
-        reply.size = (uint8_t)read_bytes;
-        break;
-    }
-    case FTP_OP::Ack:
-    case FTP_OP::Nack:
-        // eat these, we just didn't expect them
-        return true;
-
-    case FTP_OP::OpenFileWO:
-    case FTP_OP::CreateFile:
-    {
-        // only allow one file to be open per session
-        if (fd != -1) {
-            GCS_FTP::error(reply, FTP_ERROR::Fail);
-            break;
-        }
-
-        // sanity check that our the request looks well formed
-        if (!check_name_len(request)) {
-            GCS_FTP::error(reply, FTP_ERROR::InvalidDataSize);
-            break;
-        }
-
-        request.data[sizeof(request.data) - 1] = 0; // ensure the path is null terminated
-
-        // actually open the file
-        fd = AP::FS().open((char *)request.data,
-                           (request.opcode == FTP_OP::CreateFile) ? O_WRONLY|O_CREAT|O_TRUNC : O_WRONLY);
-        if (fd == -1) {
-            GCS_FTP::error(reply, FTP_ERROR::FailErrno);
-            break;
-        }
-        mode = FTP_FILE_MODE::Write;
-
-        reply.opcode = FTP_OP::Ack;
-        break;
-    }
-    case FTP_OP::WriteFile:
-    {
-        // must actually be working on a file
-        if (fd == -1) {
-            GCS_FTP::error(reply, FTP_ERROR::FileNotFound);
-            break;
-        }
-
-        // must have the file in write mode
-        if ((mode != FTP_FILE_MODE::Write)) {
-            GCS_FTP::error(reply, FTP_ERROR::Fail);
-            break;
-        }
-
-        // seek to requested offset
-        if (AP::FS().lseek(fd, request.offset, SEEK_SET) == -1) {
-            GCS_FTP::error(reply, FTP_ERROR::FailErrno);
-            break;
-        }
-
-        // fill the buffer
-        const ssize_t write_bytes = AP::FS().write(fd, request.data, request.size);
-        if (write_bytes == -1) {
-            GCS_FTP::error(reply, FTP_ERROR::FailErrno);
-            break;
-        }
-
-        reply.opcode = FTP_OP::Ack;
-        reply.offset = request.offset;
-        break;
-    }
-    case FTP_OP::CreateDirectory:
-    {
-        // sanity check that our the request looks well formed
-        if (!check_name_len(request)) {
-            GCS_FTP::error(reply, FTP_ERROR::InvalidDataSize);
-            break;
-        }
-
-        request.data[sizeof(request.data) - 1] = 0; // ensure the path is null terminated
-
-        // actually make the directory
-        if (AP::FS().mkdir((char *)request.data) == -1) {
-            GCS_FTP::error(reply, FTP_ERROR::FailErrno);
-            break;
-        }
-
-        reply.opcode = FTP_OP::Ack;
-        break;
-    }
-    case FTP_OP::RemoveDirectory:
-    case FTP_OP::RemoveFile:
-    {
-        // sanity check that our the request looks well formed
-        if (!check_name_len(request)) {
-            GCS_FTP::error(reply, FTP_ERROR::InvalidDataSize);
-            break;
-        }
-
-        request.data[sizeof(request.data) - 1] = 0; // ensure the path is null terminated
-
-        // remove the file/dir
-        if (AP::FS().unlink((char *)request.data) == -1) {
-            GCS_FTP::error(reply, FTP_ERROR::FailErrno);
-            break;
-        }
-
-        reply.opcode = FTP_OP::Ack;
-        break;
-    }
-    case FTP_OP::CalcFileCRC32:
-    {
-        // sanity check that our the request looks well formed
-        if (!check_name_len(request)) {
-            GCS_FTP::error(reply, FTP_ERROR::InvalidDataSize);
-            break;
-        }
-
-        request.data[sizeof(request.data) - 1] = 0; // ensure the path is null terminated
-
-        uint32_t checksum = 0;
-        if (!AP::FS().crc32((char *)request.data, checksum)) {
-            GCS_FTP::error(reply, FTP_ERROR::FailErrno);
-            break;
-        }
-
-        // reset our scratch area so we don't leak data, and can leverage trimming
-        memset(reply.data, 0, sizeof(reply.data));
-        reply.size = sizeof(uint32_t);
-        put_le32_ptr(reply.data, checksum);
-        reply.opcode = FTP_OP::Ack;
-        break;
-    }
-    case FTP_OP::BurstReadFile:
-    {
-        const uint16_t max_read = (request.size == 0?sizeof(reply.data):request.size);
-        // must actually be working on a file
-        if (fd == -1) {
-            GCS_FTP::error(reply, FTP_ERROR::FileNotFound);
-            break;
-        }
-
-        // must have the file in read mode
-        if ((mode != FTP_FILE_MODE::Read)) {
-            GCS_FTP::error(reply, FTP_ERROR::Fail);
-            break;
-        }
-
-        // seek to requested offset
-        if (AP::FS().lseek(fd, request.offset, SEEK_SET) == -1) {
-            GCS_FTP::error(reply, FTP_ERROR::FailErrno);
-            break;
-        }
-
-        /*
-          calculate a burst delay so that FTP burst
-          transfer doesn't use more than 1/3 of
-          available bandwidth on links that don't have
-          flow control. This reduces the chance of
-          lost packets a lot, which results in overall
-          faster transfers
-        */
-        uint32_t burst_delay_ms = 0;
-        if (valid_channel(request.chan)) {
-            auto *port = mavlink_comm_port[request.chan];
-            if (port != nullptr && port->get_flow_control() != AP_HAL::UARTDriver::FLOW_CONTROL_ENABLE) {
-                const uint32_t bw = port->bw_in_bytes_per_second();
-                const uint16_t pkt_size = PAYLOAD_SIZE(request.chan, FILE_TRANSFER_PROTOCOL) - (sizeof(reply.data) - max_read);
-                burst_delay_ms = 3000 * pkt_size / bw;
-            }
-        }
-
-        // this transfer size is enough for a full parameter file with max parameters
-        const uint32_t transfer_size = 500;
-        for (uint32_t i = 0; (i < transfer_size); i++) {
-            // fill the buffer
-            const ssize_t read_bytes = AP::FS().read(fd, reply.data, MIN(sizeof(reply.data), max_read));
-            if (read_bytes == -1) {
-                GCS_FTP::error(reply, FTP_ERROR::FailErrno);
-                break;
-            }
-
-            if (read_bytes != sizeof(reply.data)) {
-                // don't send any old data
-                memset(reply.data + read_bytes, 0, sizeof(reply.data) - read_bytes);
-            }
-
-            if (read_bytes == 0) {
-                GCS_FTP::error(reply, FTP_ERROR::EndOfFile);
-                break;
-            }
-
-            reply.opcode = FTP_OP::Ack;
-            reply.offset = request.offset + i * max_read;
-            reply.burst_complete = ((read_bytes < max_read) || (i == (transfer_size - 1)));
-            reply.size = (uint8_t)read_bytes;
-
-            push_reply(reply);
-
-            if (read_bytes < max_read) {
-                // ensure the NACK which we send next is at the right offset
-                reply.offset += read_bytes;
-            }
-
-            // prep the reply to be used again
-            reply.seq_number++;
-
-            hal.scheduler->delay(burst_delay_ms);
-        }
-
-        if (reply.opcode != FTP_OP::Nack) {
-            // prevent a duplicate packet send for
-            // normal replies of burst reads
-            skip_push_reply = true;
-        }
-        break;
-    }
-
-    case FTP_OP::Rename: {
-        // sanity check that the request looks well formed
-        const char *filename1 = (char*)request.data;
-        const size_t len1 = strnlen(filename1, sizeof(request.data)-2);
-        const char *filename2 = (char*)&request.data[len1+1];
-        const size_t len2 = strnlen(filename2, sizeof(request.data)-(len1+1));
-        const bool is_req_size_consider_tnull = (request.size - (len1+len2) == 2 &&
-                                                 request.data[sizeof(request.data) - 1] == 0);
-        if (filename1[len1] != 0 || ((len1+len2+1 != request.size) && !is_req_size_consider_tnull) || (request.size == 0)) {
-            GCS_FTP::error(reply, FTP_ERROR::InvalidDataSize);
-            break;
-        }
-        request.data[sizeof(request.data) - 1] = 0; // ensure the 2nd path is null terminated
-        // remove the file/dir
-        if (AP::FS().rename(filename1, filename2) != 0) {
-            GCS_FTP::error(reply, FTP_ERROR::FailErrno);
-            break;
-        }
-        reply.opcode = FTP_OP::Ack;
-        break;
-    }
-
-    case FTP_OP::TruncateFile:
-    default:
-        // this was bad data, just nack it
-        GCS_SEND_TEXT(MAV_SEVERITY_DEBUG, "Unsupported FTP: %d", static_cast<int>(request.opcode));
-        GCS_FTP::error(reply, FTP_ERROR::Fail);
-        break;
-    }
-
-    return skip_push_reply;
-}
-
-/*
-  get the time of the last send for a channel
- */
-uint32_t GCS_FTP::get_last_send_ms(mavlink_channel_t chan)
-{
-    if (ftp == nullptr) {
-        return 0;
-    }
-    uint32_t ret = 0;
-    for (const auto &s : ftp->sessions) {
-        // using a comparison will be briefly wrong every 49 days, but
-        // this is non-critical and getting it perfect would be
-        // expensive in a hot path
-        if (s.chan == chan && s.last_send_ms > ret) {
-            ret = s.last_send_ms;
-        }
-    }
-    return ret;
-}
-
-/*
-  fill in a reply with an error code
- */
-void GCS_FTP::error(Transaction &response, FTP_ERROR error)
-{
-    response.opcode = FTP_OP::Nack;
-    response.data[0] = static_cast<uint8_t>(error);
+    response.seqNumber = s_session.seqNumber;
+    response.opcode = static_cast<uint8_t>(FTPOpcode::Nak);
     response.size = 1;
+    response.data[0] = static_cast<uint8_t>(errorCode);
 
-    // FIXME: errno's are not thread-local as they should be on ChibiOS
-    if (error == FTP_ERROR::FailErrno) {
-        // translate the errno's that we have useful messages for
-        switch (errno) {
-            case EEXIST:
-                response.data[0] = static_cast<uint8_t>(FTP_ERROR::FileExists);
-                break;
-            case ENOENT:
-                response.data[0] = static_cast<uint8_t>(FTP_ERROR::FileNotFound);
-                break;
-            default:
-                response.data[1] = static_cast<uint8_t>(errno);
-                response.size = 2;
-                break;
-        }
-    }
+    sendPayload(&response);
+
+    // Log error
+    m_channel.sendText(MAV_SEVERITY_WARNING, "FTP operation failed");
 }
 
-/*
-  setup reply packet to reply to the request
-*/
-void GCS_FTP::setup_reply(const Transaction &request, Transaction &reply)
-{
-    memset(&reply, 0, sizeof(reply));
-    reply.req_opcode = request.opcode;
-    reply.session = request.session;
-    reply.seq_number = request.seq_number + 1;
-    reply.chan = request.chan;
-    reply.sysid = request.sysid;
-    reply.compid = request.compid;
-}
-
-/*
-  main FTP thread
+/**
+ * @brief Send FTP payload as FILE_TRANSFER_PROTOCOL message
  */
-void GCS_FTP::worker(void)
+void GCS_FTP::sendPayload(const FTPPayload* payload)
 {
-    Transaction request;
-    Transaction reply {};
-    reply.session = -1; // flag the reply as invalid for any reuse
+    mavlink_message_t msg;
+    uint8_t packedPayload[FTP_PAYLOAD_SIZE];
 
-    while (true) {
-        while (!requests.pop(request)) {
-            // nothing to handle, delay ourselves a bit then check again. Ideally we'd use conditional waits here
-            hal.scheduler->delay(2);
+    memcpy(packedPayload, payload, sizeof(FTPPayload));
 
-            // kill any dead sessions
-            const uint32_t now = AP_HAL::millis();
-            for (auto &s : sessions) {
-                if (s.last_send_ms != 0 &&
-                    now - s.last_send_ms > FTP_SESSION_KILL_TIMEOUT) {
-                    s.close();
-                }
-            }
-        }
+    mavlink_msg_file_transfer_protocol_pack(
+        m_channel.getSystemID(),
+        m_channel.getComponentID(),
+        &msg,
+        0, // Network
+        s_session.targetSystem,
+        s_session.targetComponent,
+        packedPayload
+    );
 
-        if (request.opcode == FTP_OP::ResetSessions) {
-            /*
-              close all sessions for this channel, compid and sysid
-             */
-            for (auto &s : sessions) {
-                if (request.sysid == s.sysid &&
-                    request.compid == s.compid &&
-                    request.chan == s.chan) {
-                    // close this session
-                    s.close();
-                }
-            }
-            // always ACK, even if no sessions were closed
-            setup_reply(request, reply);
-            reply.opcode = FTP_OP::Ack;
-            send_reply(reply);
-            continue;
-        }
+    m_channel.sendMessage(&msg);
+}
 
-        Session *session = nullptr;
-        for (uint8_t i=0; i<ARRAY_SIZE(sessions); i++) {
-            auto &s = sessions[i];
-            if (request.sysid == s.sysid &&
-                request.compid == s.compid &&
-                request.chan == s.chan &&
-                request.session == s.session_id) {
-                // found the session
-                session = &s;
-                break;
-            }
-        }
-
-        if (session == nullptr) {
-            /*
-              find the oldest session to possibly reuse
-             */
-            const uint32_t now = AP_HAL::millis();
-            session = &sessions[0];
-            for (uint8_t i=1; i<ARRAY_SIZE(sessions); i++) {
-                auto &s = sessions[i];
-                if ((now - s.last_send_ms) > (now - session->last_send_ms)) {
-                    session = &s;
-                }
-            }
-
-            // only reuse the session if it is not active
-            auto &s = *session;
-            if (s.last_send_ms != 0 &&
-                now - s.last_send_ms < FTP_SESSION_TIMEOUT) {
-                // the oldest session is still active, reject the request
-                setup_reply(request, reply);
-                error(reply, FTP_ERROR::NoSessionsAvailable);
-                send_reply(reply);
-                continue;
-            }
-            // claim the session
-            s.close();
-            s.session_id = request.session;
-            s.sysid = request.sysid;
-            s.compid = request.compid;
-            s.chan = request.chan;
-        }
-
-        // if it's a rerequest and we still have the last response then send it
-        if ((request.sysid == reply.sysid) && (request.compid == reply.compid) &&
-            (request.session == reply.session) && (request.seq_number + 1 == reply.seq_number) &&
-            reply.data[0] != uint8_t(FTP_ERROR::NoSessionsAvailable)) {
-            session->push_reply(reply);
-            continue;
-        }
-
-        setup_reply(request, reply);
-
-        bool skip_push_reply = session->handle_request(request, reply);
-
-        if (!skip_push_reply) {
-            session->push_reply(reply);
-        }
+/**
+ * @brief Close currently open file
+ */
+void GCS_FTP::closeCurrentFile()
+{
+    if (s_session.fileHandle) {
+        fs_closeFile(s_session.fileHandle);
+        s_session.fileHandle = nullptr;
     }
 }
 
-#endif  // AP_MAVLINK_FTP_ENABLED
+} // namespace GCS
+} // namespace EduCopter

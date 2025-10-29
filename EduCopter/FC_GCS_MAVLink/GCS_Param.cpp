@@ -1,472 +1,451 @@
-/*
-   GCS MAVLink functions related to parameter handling
-
-   This program is free software: you can redistribute it and/or modify
-   it under the terms of the GNU General Public License as published by
-   the Free Software Foundation, either version 3 of the License, or
-   (at your option) any later version.
-
-   This program is distributed in the hope that it will be useful,
-   but WITHOUT ANY WARRANTY; without even the implied warranty of
-   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-   GNU General Public License for more details.
-
-   You should have received a copy of the GNU General Public License
-   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+/**
+ * @file GCS_Param.cpp
+ * @brief Parameter management and MAVLink parameter protocol implementation
+ *
+ * This file implements the MAVLink parameter protocol for EduCopter, allowing
+ * ground stations to discover, read, and write vehicle parameters.
+ *
+ * Supports:
+ * - PARAM_REQUEST_LIST: List all parameters
+ * - PARAM_REQUEST_READ: Read specific parameter by index or name
+ * - PARAM_SET: Set parameter value
+ * - PARAM_VALUE: Send parameter value to GCS
+ *
+ * @author EduCopter Development Team
+ * @date 2025
  */
-
-#include "GCS_config.h"
-
-#if HAL_GCS_ENABLED
-
-#include <AP_HAL/AP_HAL.h>
 
 #include "GCS.h"
-#include <AP_Logger/AP_Logger.h>
-#include <AP_BoardConfig/AP_BoardConfig.h>
+#include "GCS_config.h"
+#include <cstring>
+#include <cmath>
 
-extern const AP_HAL::HAL& hal;
+namespace EduCopter {
+namespace GCS {
 
-// queue of pending parameter requests and replies
-ObjectBuffer<GCS_MAVLINK::pending_param_request> GCS_MAVLINK::param_requests(20);
-ObjectBuffer<GCS_MAVLINK::pending_param_reply> GCS_MAVLINK::param_replies(5);
+// External parameter system interface (implemented by vehicle)
+extern uint16_t getParameterCount();
+extern const char* getParameterName(uint16_t index);
+extern float getParameterValue(uint16_t index);
+extern bool setParameterValue(uint16_t index, float value);
+extern int16_t findParameterIndex(const char* name);
+extern MAV_PARAM_TYPE getParameterType(uint16_t index);
 
-bool GCS_MAVLINK::param_timer_registered;
+// Parameter streaming state
+struct ParamStreamState {
+    bool active;
+    uint16_t currentIndex;
+    uint16_t totalParams;
+    uint32_t lastSendMS;
+};
+
+static ParamStreamState s_paramStream = {false, 0, 0, 0};
 
 /**
- * @brief Send the next pending parameter, called from deferred message
- * handling code
+ * @brief Handle PARAM_REQUEST_LIST message
+ *
+ * Starts streaming all parameters to the requesting system.
+ * Parameters are sent incrementally to avoid overwhelming the channel.
+ *
+ * @param channel Channel that received the request
+ * @param msg MAVLink message
  */
-void
-GCS_MAVLINK::queued_param_send()
+void GCSChannel::handleParamRequestList(const mavlink_message_t& msg)
 {
-    // send parameter async replies
-    uint8_t async_replies_sent_count = send_parameter_async_replies();
-
-    // now send the streaming parameters (from PARAM_REQUEST_LIST)
-    if (_queued_parameter == nullptr) {
-        // .... or not....
-        return;
-    }
-
-    const uint32_t tnow = AP_HAL::millis();
-    const uint32_t tstart = AP_HAL::micros();
-
-    // use at most 30% of bandwidth on parameters
-    const uint32_t link_bw = _port->bw_in_bytes_per_second();
-
-    uint32_t bytes_allowed = link_bw * (tnow - _queued_parameter_send_time_ms) / 3333;
-    const uint16_t size_for_one_param_value_msg = MAVLINK_MSG_ID_PARAM_VALUE_LEN + packet_overhead();
-    if (bytes_allowed < size_for_one_param_value_msg) {
-        bytes_allowed = size_for_one_param_value_msg;
-    }
-    if (bytes_allowed > txspace()) {
-        bytes_allowed = txspace();
-    }
-    uint32_t count = bytes_allowed / size_for_one_param_value_msg;
-
-    // when we don't have flow control we really need to keep the
-    // param download very slow, or it tends to stall
-    if (!have_flow_control() && count > 5) {
-        count = 5;
-    }
-    if (async_replies_sent_count >= count) {
-        return;
-    }
-    count -= async_replies_sent_count;
-
-    while (count && _queued_parameter != nullptr && last_txbuf_is_greater(33)) {
-        char param_name[AP_MAX_NAME_SIZE];
-        _queued_parameter->copy_name_token(_queued_parameter_token, param_name, sizeof(param_name), true);
-
-        mavlink_msg_param_value_send(
-            chan,
-            param_name,
-            _queued_parameter->cast_to_float(_queued_parameter_type),
-            mav_param_type(_queued_parameter_type),
-            _queued_parameter_count,
-            _queued_parameter_index);
-
-        _queued_parameter = AP_Param::next_scalar(&_queued_parameter_token, &_queued_parameter_type);
-        _queued_parameter_index++;
-
-        if (AP_HAL::micros() - tstart > 1000) {
-            // don't use more than 1ms sending blocks of parameters
-            break;
-        }
-        count--;
-    }
-    _queued_parameter_send_time_ms = tnow;
-}
-
-/*
-  return true if a channel has flow control
- */
-bool GCS_MAVLINK::have_flow_control(void)
-{
-    if (_port == nullptr) {
-        return false;
-    }
-
-    if (_port->flow_control_enabled()) {
-        return true;
-    }
-
-    if (chan == MAVLINK_COMM_0) {
-        // assume USB console has flow control
-        return hal.gpio->usb_connected();
-    }
-
-    return false;
-}
-
-
-/*
-  handle a request to change stream rate. Note that copter passes in
-  save==false so we don't want the save to happen when the user connects the
-  ground station.
- */
-void GCS_MAVLINK::handle_request_data_stream(const mavlink_message_t &msg)
-{
-    mavlink_request_data_stream_t packet;
-    mavlink_msg_request_data_stream_decode(&msg, &packet);
-
-    int16_t freq = 0;     // packet frequency
-
-    if (packet.start_stop == 0)
-        freq = 0;                     // stop sending
-    else if (packet.start_stop == 1)
-        freq = packet.req_message_rate;                     // start sending
-    else
-        return;
-
-    // if stream_id is still NUM_STREAMS at the end of this switch
-    // block then either we set stream rates for all streams, or we
-    // were asked to set the streamrate for an unrecognised stream
-    streams stream_id = NUM_STREAMS;
-    switch (packet.req_stream_id) {
-    case MAV_DATA_STREAM_ALL:
-        for (uint8_t i=0; i<NUM_STREAMS; i++) {
-            if (i == STREAM_PARAMS) {
-                // don't touch parameter streaming rate; it is
-                // considered "internal".
-                continue;
-            }
-            if (persist_streamrates()) {
-                streamRates[i].set_and_save_ifchanged(freq);
-            } else {
-                streamRates[i].set(freq);
-            }
-            initialise_message_intervals_for_stream((streams)i);
-        }
-        break;
-    case MAV_DATA_STREAM_RAW_SENSORS:
-        stream_id = STREAM_RAW_SENSORS;
-        break;
-    case MAV_DATA_STREAM_EXTENDED_STATUS:
-        stream_id = STREAM_EXTENDED_STATUS;
-        break;
-    case MAV_DATA_STREAM_RC_CHANNELS:
-        stream_id = STREAM_RC_CHANNELS;
-        break;
-    case MAV_DATA_STREAM_RAW_CONTROLLER:
-        stream_id = STREAM_RAW_CONTROLLER;
-        break;
-    case MAV_DATA_STREAM_POSITION:
-        stream_id = STREAM_POSITION;
-        break;
-    case MAV_DATA_STREAM_EXTRA1:
-        stream_id = STREAM_EXTRA1;
-        break;
-    case MAV_DATA_STREAM_EXTRA2:
-        stream_id = STREAM_EXTRA2;
-        break;
-    case MAV_DATA_STREAM_EXTRA3:
-        stream_id = STREAM_EXTRA3;
-        break;
-    }
-
-    if (stream_id == NUM_STREAMS) {
-        // asked to set rate on unknown stream (or all were set already)
-        return;
-    }
-
-    AP_Int16 *rate = &streamRates[stream_id];
-
-    if (rate != nullptr) {
-        if (persist_streamrates()) {
-            rate->set_and_save_ifchanged(freq);
-        } else {
-            rate->set(freq);
-        }
-        initialise_message_intervals_for_stream(stream_id);
-    }
-}
-
-void GCS_MAVLINK::handle_param_request_list(const mavlink_message_t &msg)
-{
-    if (!params_ready()) {
-        return;
-    }
-
     mavlink_param_request_list_t packet;
     mavlink_msg_param_request_list_decode(&msg, &packet);
 
-    // requesting parameters is a convenient way to get extra information
-    send_banner();
-
-    // Start sending parameters - next call to ::update will kick the first one out
-    _queued_parameter = AP_Param::first(&_queued_parameter_token, &_queued_parameter_type);
-    _queued_parameter_index = 0;
-    _queued_parameter_count = AP_Param::count_parameters();
-    _queued_parameter_send_time_ms = AP_HAL::millis(); // avoid initial flooding
-}
-
-void GCS_MAVLINK::handle_param_request_read(const mavlink_message_t &msg)
-{
-    if (param_requests.space() == 0) {
-        // we can't process this right now, drop it
+    // Check if request is for us
+    if (packet.target_system != m_mavlink.getSystemID() &&
+        packet.target_system != 0) {
         return;
     }
-    
+
+    if (packet.target_component != m_mavlink.getComponentID() &&
+        packet.target_component != MAV_COMP_ID_ALL) {
+        return;
+    }
+
+    // Start parameter streaming
+    s_paramStream.active = true;
+    s_paramStream.currentIndex = 0;
+    s_paramStream.totalParams = getParameterCount();
+    s_paramStream.lastSendMS = millis();
+
+    sendText(MAV_SEVERITY_INFO, "Sending parameters...");
+}
+
+/**
+ * @brief Handle PARAM_REQUEST_READ message
+ *
+ * Sends a specific parameter by index or name.
+ *
+ * @param channel Channel that received the request
+ * @param msg MAVLink message
+ */
+void GCSChannel::handleParamRequestRead(const mavlink_message_t& msg)
+{
     mavlink_param_request_read_t packet;
     mavlink_msg_param_request_read_decode(&msg, &packet);
 
-    /*
-      we reserve some space for sending parameters if the client ever
-      fails to get a parameter due to lack of space
-     */
-    uint32_t saved_reserve_param_space_start_ms = reserve_param_space_start_ms;
-    reserve_param_space_start_ms = 0; // bypass packet_overhead_chan reservation checking
-    if (!HAVE_PAYLOAD_SPACE(chan, PARAM_VALUE)) {
-        reserve_param_space_start_ms = AP_HAL::millis();
-    } else {
-        reserve_param_space_start_ms = saved_reserve_param_space_start_ms;
+    // Check if request is for us
+    if (packet.target_system != m_mavlink.getSystemID() &&
+        packet.target_system != 0) {
+        return;
     }
 
-    struct pending_param_request req;
-    req.chan = chan;
-    req.param_index = packet.param_index;
-    memcpy(req.param_name, packet.param_id, MIN(sizeof(packet.param_id), sizeof(req.param_name)));
-    req.param_name[AP_MAX_NAME_SIZE] = 0;
+    if (packet.target_component != m_mavlink.getComponentID() &&
+        packet.target_component != MAV_COMP_ID_ALL) {
+        return;
+    }
 
-    // queue it for processing by io timer
-    param_requests.push(req);
+    int16_t paramIndex = -1;
 
-    // speaking of which, we'd best make sure it is running:
-    if (!param_timer_registered) {
-        param_timer_registered = true;
-        hal.scheduler->register_io_process(FUNCTOR_BIND_MEMBER(&GCS_MAVLINK::param_io_timer, void));
+    // Find parameter by index or name
+    if (packet.param_index >= 0) {
+        paramIndex = packet.param_index;
+    } else {
+        // Search by name (ensure null termination)
+        char paramName[17];
+        memcpy(paramName, packet.param_id, 16);
+        paramName[16] = '\0';
+        paramIndex = findParameterIndex(paramName);
+    }
+
+    // Send parameter if found
+    if (paramIndex >= 0 && paramIndex < getParameterCount()) {
+        sendParameter(paramIndex);
+    } else {
+        sendText(MAV_SEVERITY_WARNING, "Parameter not found");
     }
 }
 
-void GCS_MAVLINK::handle_param_set(const mavlink_message_t &msg)
+/**
+ * @brief Handle PARAM_SET message
+ *
+ * Sets a parameter value and sends confirmation.
+ * Validates the parameter before setting.
+ *
+ * @param channel Channel that received the request
+ * @param msg MAVLink message
+ */
+void GCSChannel::handleParamSet(const mavlink_message_t& msg)
 {
     mavlink_param_set_t packet;
     mavlink_msg_param_set_decode(&msg, &packet);
-    enum ap_var_type var_type;
 
-    // set parameter
-    AP_Param *vp;
-    char key[AP_MAX_NAME_SIZE+1];
-    strncpy(key, (char *)packet.param_id, AP_MAX_NAME_SIZE);
-    key[AP_MAX_NAME_SIZE] = 0;
-
-    // find existing param so we can get the old value
-    uint16_t parameter_flags = 0;
-    vp = AP_Param::find(key, &var_type, &parameter_flags);
-    if (vp == nullptr || isnan(packet.param_value) || isinf(packet.param_value)) {
+    // Check if request is for us
+    if (packet.target_system != m_mavlink.getSystemID()) {
         return;
     }
 
-    float old_value = vp->cast_to_float(var_type);
-
-    if (!vp->allow_set_via_mavlink(parameter_flags)) {
-        // don't warn the user about this failure if we are dropping
-        // messages here.  This is on the assumption that scripting is
-        // currently responsible for setting parameters and may set
-        // the value instead of us.
-        if (gcs().get_allow_param_set()) {
-            GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "Param write denied (%s)", key);
-        }
-        // send the readonly value
-        send_parameter_value(key, var_type, old_value);
+    if (packet.target_component != m_mavlink.getComponentID() &&
+        packet.target_component != MAV_COMP_ID_ALL) {
         return;
     }
 
-    // set the value
-    vp->set_float(packet.param_value, var_type);
+    // Find parameter by name (ensure null termination)
+    char paramName[17];
+    memcpy(paramName, packet.param_id, 16);
+    paramName[16] = '\0';
 
-    /*
-      we force the save if the value is not equal to the old
-      value. This copes with the use of override values in
-      constructors, such as PID elements. Otherwise a set to the
-      default value which differs from the constructor value doesn't
-      save the change
-     */
-    bool force_save = !is_equal(packet.param_value, old_value);
+    int16_t paramIndex = findParameterIndex(paramName);
 
-    // save the change
-    vp->save(force_save);
-
-    if (force_save && (parameter_flags & AP_PARAM_FLAG_ENABLE)) {
-        AP_Param::invalidate_count();
-    }
-
-#if HAL_LOGGING_ENABLED
-    AP_Logger *logger = AP_Logger::get_singleton();
-    if (logger != nullptr) {
-        logger->Write_Parameter(key, vp->cast_to_float(var_type));
-    }
-#endif
-}
-
-void GCS_MAVLINK::send_parameter_value(const char *param_name, ap_var_type param_type, float param_value)
-{
-    if (!HAVE_PAYLOAD_SPACE(chan, PARAM_VALUE)) {
-        return;
-    }
-    mavlink_msg_param_value_send(
-        chan,
-        param_name,
-        param_value,
-        mav_param_type(param_type),
-        AP_Param::count_parameters(),
-        -1);
-}
-
-/*
-  send a parameter value message to all active MAVLink connections
- */
-void GCS::send_parameter_value(const char *param_name, ap_var_type param_type, float param_value)
-{
-    mavlink_param_value_t packet{};
-    const uint8_t to_copy = MIN(ARRAY_SIZE(packet.param_id), strlen(param_name));
-    memcpy(packet.param_id, param_name, to_copy);
-    packet.param_value = param_value;
-    packet.param_type = GCS_MAVLINK::mav_param_type(param_type);
-    packet.param_count = AP_Param::count_parameters();
-    packet.param_index = -1;
-
-    gcs().send_to_active_channels(MAVLINK_MSG_ID_PARAM_VALUE,
-                                  (const char *)&packet);
-
-#if HAL_LOGGING_ENABLED
-    // also log to AP_Logger
-    AP_Logger *logger = AP_Logger::get_singleton();
-    if (logger != nullptr) {
-        logger->Write_Parameter(param_name, param_value);
-    }
-#endif
-}
-
-
-/*
-  timer callback for async parameter requests
- */
-void GCS_MAVLINK::param_io_timer(void)
-{
-    struct pending_param_request req;
-
-    // this is mostly a no-op, but doing this here means we won't
-    // block the main thread counting parameters (~30ms on PH)
-    AP_Param::count_parameters();
-
-    if (param_replies.space() == 0) {
-        // no room
-        return;
-    }
-    
-    if (!param_requests.pop(req)) {
-        // nothing to do
+    if (paramIndex < 0 || paramIndex >= getParameterCount()) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "Unknown parameter: %s", paramName);
+        sendText(MAV_SEVERITY_WARNING, buf);
         return;
     }
 
-    struct pending_param_reply reply;
-    AP_Param *vp;
+    // Get current value for comparison
+    float oldValue = getParameterValue(paramIndex);
+    float newValue = packet.param_value;
 
-    if (req.param_index != -1) {
-        AP_Param::ParamToken token {};
-        vp = AP_Param::find_by_index(req.param_index, &reply.p_type, &token);
-        if (vp == nullptr) {
-            return;
-        }
-        vp->copy_name_token(token, reply.param_name, AP_MAX_NAME_SIZE, true);
+    // Validate new value (basic sanity checks)
+    if (std::isnan(newValue) || std::isinf(newValue)) {
+        sendText(MAV_SEVERITY_WARNING, "Invalid parameter value");
+        sendParameter(paramIndex); // Send current value
+        return;
+    }
+
+    // Set the parameter
+    bool success = setParameterValue(paramIndex, newValue);
+
+    if (success) {
+        // Log the change
+        char buf[100];
+        snprintf(buf, sizeof(buf), "Param %s: %.4f -> %.4f",
+                 paramName, oldValue, newValue);
+        sendText(MAV_SEVERITY_INFO, buf);
+
+        // Send confirmation with actual value (may differ slightly)
+        sendParameter(paramIndex);
     } else {
-        strncpy(reply.param_name, req.param_name, AP_MAX_NAME_SIZE+1);
-        vp = AP_Param::find(req.param_name, &reply.p_type);
-        if (vp == nullptr) {
-            return;
-        }
+        sendText(MAV_SEVERITY_WARNING, "Parameter set failed");
+        sendParameter(paramIndex); // Send current value
     }
-
-    reply.chan = req.chan;
-    reply.param_name[AP_MAX_NAME_SIZE] = 0;
-    reply.value = vp->cast_to_float(reply.p_type);
-    reply.param_index = req.param_index;
-    reply.count = AP_Param::count_parameters();
-
-    // queue for transmission
-    param_replies.push(reply);
 }
 
-/*
-  send replies to PARAM_REQUEST_READ
+/**
+ * @brief Send a parameter value message
+ *
+ * Sends PARAM_VALUE message for a specific parameter.
+ *
+ * @param index Parameter index to send
  */
-uint8_t GCS_MAVLINK::send_parameter_async_replies()
+void GCSChannel::sendParameter(uint16_t index)
 {
-    uint8_t async_replies_sent_count = 0;
-
-    while (async_replies_sent_count < 5) {
-        struct pending_param_reply reply;
-        if (!param_replies.peek(reply)) {
-            return async_replies_sent_count;
-        }
-
-        /*
-          we reserve some space for sending parameters if the client ever
-          fails to get a parameter due to lack of space
-        */
-        uint32_t saved_reserve_param_space_start_ms = reserve_param_space_start_ms;
-        reserve_param_space_start_ms = 0; // bypass packet_overhead_chan reservation checking
-        if (!HAVE_PAYLOAD_SPACE(reply.chan, PARAM_VALUE)) {
-            reserve_param_space_start_ms = AP_HAL::millis();
-            return async_replies_sent_count;
-        }
-        reserve_param_space_start_ms = saved_reserve_param_space_start_ms;
-
-        mavlink_msg_param_value_send(
-            reply.chan,
-            reply.param_name,
-            reply.value,
-            mav_param_type(reply.p_type),
-            reply.count,
-            reply.param_index);
-
-        _queued_parameter_send_time_ms = AP_HAL::millis();
-        async_replies_sent_count++;
-
-        if (!param_replies.pop()) {
-            // internal error...
-            return async_replies_sent_count;
-        }
+    if (index >= getParameterCount()) {
+        return;
     }
-    return async_replies_sent_count;
+
+    if (!hasPayloadSpace(MAVLINK_MSG_ID_PARAM_VALUE)) {
+        return;
+    }
+
+    // Get parameter info
+    const char* name = getParameterName(index);
+    float value = getParameterValue(index);
+    MAV_PARAM_TYPE type = getParameterType(index);
+    uint16_t totalParams = getParameterCount();
+
+    // Prepare parameter name (max 16 chars, null-terminated)
+    char paramID[16];
+    memset(paramID, 0, sizeof(paramID));
+    strncpy(paramID, name, 16);
+
+    // Pack and send message
+    mavlink_message_t msg;
+    mavlink_msg_param_value_pack(
+        m_mavlink.getSystemID(),
+        m_mavlink.getComponentID(),
+        &msg,
+        paramID,
+        value,
+        type,
+        totalParams,
+        index
+    );
+
+    sendMessage(&msg);
 }
 
-void GCS_MAVLINK::handle_common_param_message(const mavlink_message_t &msg)
+/**
+ * @brief Update parameter streaming
+ *
+ * Called periodically to send queued parameters.
+ * Sends parameters at controlled rate to avoid overwhelming channel.
+ */
+void GCSChannel::updateParamStream()
 {
-    switch (msg.msgid) {
-    case MAVLINK_MSG_ID_PARAM_REQUEST_LIST:
-        handle_param_request_list(msg);
-        break;
-    case MAVLINK_MSG_ID_PARAM_SET:
-        handle_param_set(msg);
-        break;
-    case MAVLINK_MSG_ID_PARAM_REQUEST_READ:
-        handle_param_request_read(msg);
-        break;
+    if (!s_paramStream.active) {
+        return;
+    }
+
+    uint32_t nowMS = millis();
+
+    // Send parameters at ~50Hz (20ms interval) to avoid overload
+    if (nowMS - s_paramStream.lastSendMS < 20) {
+        return;
+    }
+
+    // Send next parameter
+    if (s_paramStream.currentIndex < s_paramStream.totalParams) {
+        sendParameter(s_paramStream.currentIndex);
+        s_paramStream.currentIndex++;
+        s_paramStream.lastSendMS = nowMS;
+    } else {
+        // All parameters sent
+        s_paramStream.active = false;
+        sendText(MAV_SEVERITY_INFO, "Parameters sent");
     }
 }
 
-#endif  // HAL_GCS_ENABLED
+/**
+ * @brief Send parameter value by name
+ *
+ * Convenience function to send parameter by name instead of index.
+ *
+ * @param name Parameter name
+ */
+void GCSChannel::sendParameterByName(const char* name)
+{
+    int16_t index = findParameterIndex(name);
+    if (index >= 0) {
+        sendParameter(index);
+    }
+}
+
+/**
+ * @brief Check if parameter streaming is active
+ *
+ * @return true if currently streaming parameters
+ */
+bool GCSChannel::isStreamingParams() const
+{
+    return s_paramStream.active;
+}
+
+/**
+ * @brief Cancel ongoing parameter stream
+ *
+ * Stops parameter streaming if active.
+ */
+void GCSChannel::cancelParamStream()
+{
+    if (s_paramStream.active) {
+        s_paramStream.active = false;
+        sendText(MAV_SEVERITY_INFO, "Parameter stream cancelled");
+    }
+}
+
+#if EDUCOPTER_PARAM_TABLE_ENABLED
+/**
+ * @brief Get parameter metadata
+ *
+ * Returns metadata about a parameter including min/max values,
+ * default value, and units.
+ *
+ * @param index Parameter index
+ * @param outMin Output minimum value
+ * @param outMax Output maximum value
+ * @param outDefault Output default value
+ * @return true if metadata available
+ */
+extern bool getParameterMetadata(uint16_t index, float& outMin,
+                                 float& outMax, float& outDefault);
+
+bool GCSChannel::sendParameterMetadata(uint16_t index)
+{
+    if (index >= getParameterCount()) {
+        return false;
+    }
+
+    float minVal, maxVal, defVal;
+    if (!getParameterMetadata(index, minVal, maxVal, defVal)) {
+        return false;
+    }
+
+    // Send as text (MAVLink doesn't have standard metadata message)
+    char buf[100];
+    const char* name = getParameterName(index);
+    snprintf(buf, sizeof(buf), "Param %s: min=%.2f max=%.2f def=%.2f",
+             name, minVal, maxVal, defVal);
+    sendText(MAV_SEVERITY_INFO, buf);
+
+    return true;
+}
+#endif // EDUCOPTER_PARAM_TABLE_ENABLED
+
+#if EDUCOPTER_PARAM_PERSISTENT_ENABLED
+/**
+ * @brief Save parameters to persistent storage
+ *
+ * Saves all parameters to EEPROM/flash.
+ *
+ * @return true if save successful
+ */
+extern bool saveParameters();
+
+MAV_RESULT GCSChannel::handleCommandPreflightStorage(const mavlink_command_long_t& cmd)
+{
+    // param1: 0=read, 1=write, 2=reset
+    int action = (int)cmd.param1;
+
+    if (action == 1) {
+        // Write parameters
+        if (saveParameters()) {
+            sendText(MAV_SEVERITY_INFO, "Parameters saved");
+            return MAV_RESULT_ACCEPTED;
+        } else {
+            sendText(MAV_SEVERITY_ERROR, "Parameter save failed");
+            return MAV_RESULT_FAILED;
+        }
+    } else if (action == 0) {
+        // Read parameters (reload from storage)
+        extern bool loadParameters();
+        if (loadParameters()) {
+            sendText(MAV_SEVERITY_INFO, "Parameters loaded");
+            return MAV_RESULT_ACCEPTED;
+        } else {
+            sendText(MAV_SEVERITY_ERROR, "Parameter load failed");
+            return MAV_RESULT_FAILED;
+        }
+    } else if (action == 2) {
+        // Reset to defaults
+        extern bool resetParameters();
+        if (resetParameters()) {
+            sendText(MAV_SEVERITY_INFO, "Parameters reset to defaults");
+            return MAV_RESULT_ACCEPTED;
+        } else {
+            sendText(MAV_SEVERITY_ERROR, "Parameter reset failed");
+            return MAV_RESULT_FAILED;
+        }
+    }
+
+    return MAV_RESULT_UNSUPPORTED;
+}
+#endif // EDUCOPTER_PARAM_PERSISTENT_ENABLED
+
+/**
+ * @brief Send parameter count
+ *
+ * Sends a text message with total parameter count.
+ * Useful for debugging.
+ */
+void GCSChannel::sendParameterCount()
+{
+    char buf[64];
+    uint16_t count = getParameterCount();
+    snprintf(buf, sizeof(buf), "Total parameters: %u", count);
+    sendText(MAV_SEVERITY_INFO, buf);
+}
+
+/**
+ * @brief Validate parameter index
+ *
+ * Checks if parameter index is valid.
+ *
+ * @param index Parameter index
+ * @return true if valid
+ */
+bool GCSChannel::isValidParameterIndex(uint16_t index) const
+{
+    return index < getParameterCount();
+}
+
+/**
+ * @brief Search for parameters by prefix
+ *
+ * Sends all parameters matching a name prefix.
+ * Useful for parameter groups (e.g., all "PID_*" params).
+ *
+ * @param prefix Parameter name prefix
+ */
+void GCSChannel::sendParametersByPrefix(const char* prefix)
+{
+    if (!prefix || prefix[0] == '\0') {
+        return;
+    }
+
+    size_t prefixLen = strlen(prefix);
+    uint16_t count = getParameterCount();
+    uint16_t matchCount = 0;
+
+    for (uint16_t i = 0; i < count; i++) {
+        const char* name = getParameterName(i);
+        if (strncmp(name, prefix, prefixLen) == 0) {
+            sendParameter(i);
+            matchCount++;
+        }
+    }
+
+    char buf[64];
+    snprintf(buf, sizeof(buf), "Sent %u parameters with prefix '%s'",
+             matchCount, prefix);
+    sendText(MAV_SEVERITY_INFO, buf);
+}
+
+} // namespace GCS
+} // namespace EduCopter

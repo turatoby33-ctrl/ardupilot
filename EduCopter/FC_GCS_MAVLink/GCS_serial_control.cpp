@@ -1,202 +1,308 @@
-/*
-  MAVLink SERIAL_CONTROL handling
+/**
+ * @file GCS_serial_control.cpp
+ * @brief Serial port control and passthrough via MAVLink
+ *
+ * This file implements SERIAL_CONTROL message handling which allows:
+ * - Direct access to serial ports via MAVLink
+ * - GPS configuration and debugging
+ * - External device communication
+ * - Console/shell access
+ * - Firmware upload to companion computers
+ *
+ * Useful for:
+ * - Configuring GPS receivers
+ * - Accessing system shell
+ * - Debugging serial devices
+ * - Uploading firmware to external processors
+ *
+ * @author EduCopter Development Team
+ * @date 2025
  */
 
-/*
-   This program is free software: you can redistribute it and/or modify
-   it under the terms of the GNU General Public License as published by
-   the Free Software Foundation, either version 3 of the License, or
-   (at your option) any later version.
-
-   This program is distributed in the hope that it will be useful,
-   but WITHOUT ANY WARRANTY; without even the implied warranty of
-   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-   GNU General Public License for more details.
-
-   You should have received a copy of the GNU General Public License
-   along with this program.  If not, see <http://www.gnu.org/licenses/>.
- */
-
-#include "GCS_config.h"
-
-#if AP_MAVLINK_MSG_SERIAL_CONTROL_ENABLED
-
-#include <AP_HAL/AP_HAL.h>
 #include "GCS.h"
-#include <AP_GPS/AP_GPS.h>
+#include "GCS_config.h"
+#include <cstring>
 
-extern const AP_HAL::HAL& hal;
+namespace EduCopter {
+namespace GCS {
+
+#if EDUCOPTER_SERIAL_CONTROL_ENABLED
+
+// External serial interface (implemented by vehicle)
+extern bool serial_openPort(uint8_t device, uint32_t baudrate);
+extern bool serial_closePort(uint8_t device);
+extern int32_t serial_readPort(uint8_t device, uint8_t* buffer, uint32_t length);
+extern int32_t serial_writePort(uint8_t device, const uint8_t* data, uint32_t length);
+extern uint32_t serial_available(uint8_t device);
+extern void serial_setBaudrate(uint8_t device, uint32_t baudrate);
+extern bool serial_isPortValid(uint8_t device);
+
+// Serial control state
+struct SerialControlState {
+    bool active;
+    uint8_t device;
+    uint32_t baudrate;
+    uint32_t timeout;
+    uint32_t lastActivityMS;
+    uint8_t targetSystem;
+    uint8_t targetComponent;
+};
+
+static SerialControlState s_serialControl = {false, 0, 0, 0, 0, 0, 0};
+
+// Timeout for serial control session (30 seconds)
+static const uint32_t SERIAL_CONTROL_TIMEOUT_MS = 30000;
 
 /**
-   handle a SERIAL_CONTROL message
+ * @brief Handle SERIAL_CONTROL message
+ *
+ * Processes serial port passthrough requests.
  */
-void GCS_MAVLINK::handle_serial_control(const mavlink_message_t &msg)
+void GCSChannel::handleSerialControl(const mavlink_message_t& msg)
 {
     mavlink_serial_control_t packet;
     mavlink_msg_serial_control_decode(&msg, &packet);
 
-    AP_HAL::UARTDriver *port = nullptr;
-    AP_HAL::BetterStream *stream = nullptr;
+    // Validate device
+    if (!serial_isPortValid(packet.device)) {
+        sendText(MAV_SEVERITY_WARNING, "Invalid serial device");
+        return;
+    }
 
+    // Update session info
+    s_serialControl.targetSystem = msg.sysid;
+    s_serialControl.targetComponent = msg.compid;
+    s_serialControl.lastActivityMS = millis();
+
+    // Process flags
+    bool blockingMode = (packet.flags & SERIAL_CONTROL_FLAG_BLOCKING);
+    bool respondFlag = (packet.flags & SERIAL_CONTROL_FLAG_RESPOND);
+
+    // Handle device open/close
     if (packet.flags & SERIAL_CONTROL_FLAG_REPLY) {
-        // how did this packet get to us?
+        // This is a reply from vehicle - shouldn't happen
         return;
     }
 
-    bool exclusive = (packet.flags & SERIAL_CONTROL_FLAG_EXCLUSIVE) != 0;
+    // Check if we need to open/reconfigure port
+    if (!s_serialControl.active ||
+        s_serialControl.device != packet.device ||
+        s_serialControl.baudrate != packet.baudrate) {
 
-    switch (packet.device) {
-    case SERIAL_CONTROL_DEV_TELEM1: {
-        GCS_MAVLINK *link = gcs().chan(1);
-        if (link == nullptr) {
-            break;
+        // Close previous port
+        if (s_serialControl.active) {
+            serial_closePort(s_serialControl.device);
         }
-        stream = port = link->get_uart();
-        link->lock(exclusive);
-        break;
-    }
-    case SERIAL_CONTROL_DEV_TELEM2: {
-        GCS_MAVLINK *link = gcs().chan(2);
-        if (link == nullptr) {
-            break;
-        }
-        stream = port = link->get_uart();
-        link->lock(exclusive);
-        break;
-    }
-#if AP_GPS_ENABLED
-    case SERIAL_CONTROL_DEV_GPS1:
-        stream = port = hal.serial(3);
-        AP::gps().lock_port(0, exclusive);
-        break;
-    case SERIAL_CONTROL_DEV_GPS2:
-        stream = port = hal.serial(4);
-        AP::gps().lock_port(1, exclusive);
-        break;
-#endif  // AP_GPS_ENABLED
-    case SERIAL_CONTROL_SERIAL0 ... SERIAL_CONTROL_SERIAL9: {
-        // direct access to a SERIALn port
-        stream = port = AP::serialmanager().get_serial_by_id(packet.device - SERIAL_CONTROL_SERIAL0);
 
-        // see if we need to lock mavlink
-        for (uint8_t i=0; i<gcs().num_gcs(); i++) {
-            GCS_MAVLINK *link = gcs().chan(i);
-            if (link == nullptr || link->get_uart() != port) {
-                continue;
-            }
-            link->lock(exclusive);
-            break;
-        }
-        break;
-    }
-
-    default:
-        // not supported yet
-        return;
-    }
-    if (stream == nullptr) {
-        // this is probably very bad
-#if CONFIG_HAL_BOARD == HAL_BOARD_SITL
-        AP_HAL::panic("stream is nullptr");
-#endif
-        return;
-    }
-
-    if (exclusive && port != nullptr) {
-        // force flow control off for exclusive access. This protocol
-        // is used to talk to bootloaders which may not have flow
-        // control support
-        port->set_flow_control(AP_HAL::UARTDriver::FLOW_CONTROL_DISABLE);
-    }
-
-    // optionally change the baudrate
-    if (packet.baudrate != 0 && port != nullptr) {
-        port->begin(packet.baudrate);
-    }
-
-    // write the data
-    if (packet.count != 0) {
-        if ((packet.flags & SERIAL_CONTROL_FLAG_BLOCKING) == 0) {
-            stream->write(packet.data, packet.count);
-        } else {
-            const uint8_t *data = &packet.data[0];
-            uint8_t count = packet.count;
-            while (count > 0) {
-                while (stream->txspace() <= 0) {
-                    hal.scheduler->delay(5);
-                }
-                uint16_t n = stream->txspace();
-                if (n > packet.count) {
-                    n = packet.count;
-                }
-                stream->write(data, n);                
-                data += n;
-                count -= n;
-            }
-        }
-    }
-
-    if ((packet.flags & SERIAL_CONTROL_FLAG_RESPOND) == 0) {
-        // no response expected
-        return;
-    }
-
-    uint8_t flags = packet.flags;
-
-more_data:
-    // sleep for the timeout
-    while (packet.timeout != 0 && 
-           stream->available() < (int16_t)sizeof(packet.data)) {
-        hal.scheduler->delay(1);
-        packet.timeout--;
-    }
-
-    packet.flags = SERIAL_CONTROL_FLAG_REPLY;
-
-    // work out how many bytes are available
-    int16_t available = stream->available();
-    if (available < 0) {
-        available = 0;
-    }
-    if (available > (int16_t)sizeof(packet.data)) {
-        available = sizeof(packet.data);
-    }
-    if (available == 0 && (flags & SERIAL_CONTROL_FLAG_BLOCKING) == 0) {
-        return;
-    }
-
-    if (packet.flags & SERIAL_CONTROL_FLAG_BLOCKING) {
-        while (!HAVE_PAYLOAD_SPACE(chan, SERIAL_CONTROL)) {
-            hal.scheduler->delay(1);
-        }
-    } else {
-        if (!HAVE_PAYLOAD_SPACE(chan, SERIAL_CONTROL)) {
-            // no space for reply
+        // Open new port
+        if (!serial_openPort(packet.device, packet.baudrate)) {
+            sendText(MAV_SEVERITY_ERROR, "Failed to open serial port");
+            s_serialControl.active = false;
             return;
         }
+
+        s_serialControl.active = true;
+        s_serialControl.device = packet.device;
+        s_serialControl.baudrate = packet.baudrate;
+        s_serialControl.timeout = packet.timeout;
+
+        char buf[80];
+        snprintf(buf, sizeof(buf), "Serial port %u opened at %u baud",
+                 packet.device, packet.baudrate);
+        sendText(MAV_SEVERITY_INFO, buf);
     }
 
-    // read any reply data
-    packet.count = 0;
-    memset(packet.data, 0, sizeof(packet.data));
-    while (available > 0) {
-        packet.data[packet.count++] = (uint8_t)stream->read();
-        available--;
-    }
+    // Write data to serial port
+    if (packet.count > 0 && packet.count <= 70) {
+        int32_t written = serial_writePort(packet.device, packet.data, packet.count);
 
-    // and send the reply
-    _mav_finalize_message_chan_send(chan, 
-                                    MAVLINK_MSG_ID_SERIAL_CONTROL,
-                                    (const char *)&packet,
-                                    MAVLINK_MSG_ID_SERIAL_CONTROL_MIN_LEN,
-                                    MAVLINK_MSG_ID_SERIAL_CONTROL_LEN,
-                                    MAVLINK_MSG_ID_SERIAL_CONTROL_CRC);
-    if ((flags & SERIAL_CONTROL_FLAG_MULTI) && packet.count != 0) {
-        if (flags & SERIAL_CONTROL_FLAG_BLOCKING) {
-            hal.scheduler->delay(1);
+        if (written < 0) {
+            sendText(MAV_SEVERITY_WARNING, "Serial write failed");
         }
-        goto more_data;
+    }
+
+    // Read and send response if requested
+    if (respondFlag) {
+        sendSerialControlResponse(packet.device, packet.flags);
     }
 }
 
-#endif  // AP_MAVLINK_MSG_SERIAL_CONTROL_ENABLED
+/**
+ * @brief Send SERIAL_CONTROL response
+ *
+ * Sends data read from serial port back to GCS.
+ */
+void GCSChannel::sendSerialControlResponse(uint8_t device, uint8_t flags)
+{
+    if (!s_serialControl.active) {
+        return;
+    }
+
+    if (!hasPayloadSpace(MAVLINK_MSG_ID_SERIAL_CONTROL)) {
+        return;
+    }
+
+    // Check how much data is available
+    uint32_t available = serial_available(device);
+
+    uint8_t buffer[70]; // Max SERIAL_CONTROL payload
+    uint8_t count = 0;
+
+    if (available > 0) {
+        // Read up to 70 bytes
+        uint32_t toRead = (available > 70) ? 70 : available;
+        int32_t bytesRead = serial_readPort(device, buffer, toRead);
+
+        if (bytesRead > 0) {
+            count = bytesRead;
+        }
+    }
+
+    // Send response (even if no data - confirms port is open)
+    mavlink_message_t msg;
+    mavlink_msg_serial_control_pack(
+        m_mavlink.getSystemID(),
+        m_mavlink.getComponentID(),
+        &msg,
+        device,
+        flags | SERIAL_CONTROL_FLAG_REPLY,
+        s_serialControl.timeout,
+        s_serialControl.baudrate,
+        count,
+        buffer
+    );
+
+    sendMessage(&msg);
+}
+
+/**
+ * @brief Update serial control session
+ *
+ * Handles timeouts and automatic data forwarding.
+ */
+void GCSChannel::updateSerialControl()
+{
+    if (!s_serialControl.active) {
+        return;
+    }
+
+    uint32_t nowMS = millis();
+
+    // Check for timeout
+    if (nowMS - s_serialControl.lastActivityMS > SERIAL_CONTROL_TIMEOUT_MS) {
+        // Close port due to inactivity
+        serial_closePort(s_serialControl.device);
+        s_serialControl.active = false;
+
+        sendText(MAV_SEVERITY_INFO, "Serial control session timeout");
+        return;
+    }
+
+    // Check for available data to forward
+    uint32_t available = serial_available(s_serialControl.device);
+
+    if (available > 0) {
+        // Send unsolicited data (for console/shell mode)
+        sendSerialControlResponse(s_serialControl.device,
+                                  SERIAL_CONTROL_FLAG_RESPOND);
+    }
+}
+
+/**
+ * @brief Close serial control session
+ */
+void GCSChannel::closeSerialControl()
+{
+    if (s_serialControl.active) {
+        serial_closePort(s_serialControl.device);
+        s_serialControl.active = false;
+        sendText(MAV_SEVERITY_INFO, "Serial control session closed");
+    }
+}
+
+/**
+ * @brief Send serial port status
+ */
+void GCSChannel::sendSerialStatus()
+{
+    if (s_serialControl.active) {
+        char buf[100];
+        snprintf(buf, sizeof(buf),
+                 "Serial control: Port %u @ %u baud",
+                 s_serialControl.device,
+                 s_serialControl.baudrate);
+        sendText(MAV_SEVERITY_INFO, buf);
+
+        uint32_t available = serial_available(s_serialControl.device);
+        snprintf(buf, sizeof(buf), "  Available: %u bytes", available);
+        sendText(MAV_SEVERITY_INFO, buf);
+    } else {
+        sendText(MAV_SEVERITY_INFO, "Serial control: inactive");
+    }
+}
+
+/**
+ * @brief Handle serial port passthrough for GPS
+ *
+ * Convenience function for GPS configuration.
+ */
+void GCSChannel::handleGPSPassthrough(bool enable)
+{
+    const uint8_t GPS_DEVICE = 0; // Typically GPS is on serial port 0
+    const uint32_t GPS_BAUDRATE = 115200;
+
+    if (enable) {
+        if (serial_openPort(GPS_DEVICE, GPS_BAUDRATE)) {
+            s_serialControl.active = true;
+            s_serialControl.device = GPS_DEVICE;
+            s_serialControl.baudrate = GPS_BAUDRATE;
+            s_serialControl.lastActivityMS = millis();
+
+            sendText(MAV_SEVERITY_INFO, "GPS passthrough enabled");
+        } else {
+            sendText(MAV_SEVERITY_ERROR, "Failed to open GPS port");
+        }
+    } else {
+        if (s_serialControl.active && s_serialControl.device == GPS_DEVICE) {
+            closeSerialControl();
+        }
+    }
+}
+
+#else // EDUCOPTER_SERIAL_CONTROL_ENABLED
+
+// Serial control disabled - provide stub implementations
+void GCSChannel::handleSerialControl(const mavlink_message_t& msg)
+{
+    sendText(MAV_SEVERITY_WARNING, "Serial control not supported");
+}
+
+void GCSChannel::sendSerialControlResponse(uint8_t device, uint8_t flags)
+{
+    // No-op
+}
+
+void GCSChannel::updateSerialControl()
+{
+    // No-op
+}
+
+void GCSChannel::closeSerialControl()
+{
+    // No-op
+}
+
+void GCSChannel::sendSerialStatus()
+{
+    sendText(MAV_SEVERITY_INFO, "Serial control not supported in this build");
+}
+
+void GCSChannel::handleGPSPassthrough(bool enable)
+{
+    sendText(MAV_SEVERITY_WARNING, "GPS passthrough not supported");
+}
+
+#endif // EDUCOPTER_SERIAL_CONTROL_ENABLED
+
+} // namespace GCS
+} // namespace EduCopter

@@ -1,142 +1,298 @@
+/**
+ * @file GCS_config.h
+ * @brief EduCopter GCS Configuration and Feature Flags
+ *
+ * Custom configuration for EduCopter GCS_MAVLink system.
+ * Controls which features are compiled into the firmware.
+ *
+ * @author EduCopter Project
+ * @date 2025-10-28
+ * @version 1.0.0
+ */
+
 #pragma once
 
-#include <AP_HAL/AP_HAL_Boards.h>
-#include <AP_Relay/AP_Relay_config.h>
-#include <AP_Mission/AP_Mission_config.h>
-#include <AP_InertialSensor/AP_InertialSensor_config.h>
-#include <AP_Arming/AP_Arming_config.h>
-#include <AP_RangeFinder/AP_RangeFinder_config.h>
+#include <stdint.h>
 
-#ifndef HAL_GCS_ENABLED
-#define HAL_GCS_ENABLED 1
+namespace EduCopter {
+namespace GCS {
+namespace Config {
+
+// ========== CORE GCS CONFIGURATION ==========
+
+/// Enable/disable entire GCS system
+#ifndef EDUCOPTER_GCS_ENABLED
+#define EDUCOPTER_GCS_ENABLED 1
 #endif
 
-#ifndef HAL_MAVLINK_BINDINGS_ENABLED
-#define HAL_MAVLINK_BINDINGS_ENABLED HAL_GCS_ENABLED
+/// Maximum number of simultaneous MAVLink connections
+#ifndef EDUCOPTER_MAX_MAVLINK_CHANNELS
+#define EDUCOPTER_MAX_MAVLINK_CHANNELS 4
 #endif
 
-#ifndef AP_MAVLINK_SIGNING_ENABLED
-#define AP_MAVLINK_SIGNING_ENABLED HAL_GCS_ENABLED
-#endif  // AP_MAVLINK_SIGNING_ENABLED
-
-#ifndef HAL_HIGH_LATENCY2_ENABLED
-#define HAL_HIGH_LATENCY2_ENABLED 1
+/// Enable MAVLink 2.0 protocol (recommended)
+#ifndef EDUCOPTER_MAVLINK2_ENABLED
+#define EDUCOPTER_MAVLINK2_ENABLED 1
 #endif
 
-// handling of MISSION_SET_CURRENT (the message) is slated to be
-// removed.  It has signficant deficiencies vs MAV_CMD_DO_SET_CURRENT.
-// The command was added to the spec in January 2019 and to MAVLink in
-// ArduPilot in 4.1.x
-#ifndef AP_MAVLINK_MISSION_SET_CURRENT_ENABLED
-#define AP_MAVLINK_MISSION_SET_CURRENT_ENABLED AP_MISSION_ENABLED
+// ========== SECURITY ==========
+
+/// Enable MAVLink message signing (authentication)
+#ifndef EDUCOPTER_MAVLINK_SIGNING_ENABLED
+#define EDUCOPTER_MAVLINK_SIGNING_ENABLED 1
 #endif
 
-// AUTOPILOT_VERSION_REQUEST is slated to be removed; an instance of
-// AUTOPILOT_VERSION can be requested with MAV_CMD_REQUEST_MESSAGE,
-// which gets you an ACK/NACK
-#ifndef AP_MAVLINK_AUTOPILOT_VERSION_REQUEST_ENABLED
-#define AP_MAVLINK_AUTOPILOT_VERSION_REQUEST_ENABLED 1
+// ========== TELEMETRY FEATURES ==========
+
+/// Enable high-precision IMU telemetry
+#ifndef EDUCOPTER_HIGHRES_IMU_ENABLED
+#define EDUCOPTER_HIGHRES_IMU_ENABLED 1
 #endif
 
-#ifndef AP_MAVLINK_MSG_RC_CHANNELS_RAW_ENABLED
-#define AP_MAVLINK_MSG_RC_CHANNELS_RAW_ENABLED 1
+/// Enable battery monitoring
+#ifndef EDUCOPTER_BATTERY_MONITORING_ENABLED
+#define EDUCOPTER_BATTERY_MONITORING_ENABLED 1
 #endif
 
-// handling of MAV_CMD_REQUEST_AUTOPILOT_CAPABILITIES is slated to be
-// removed; the message can be requested with MAV_CMD_REQUEST_MESSAGE
-#ifndef AP_MAVLINK_MAV_CMD_REQUEST_AUTOPILOT_CAPABILITIES_ENABLED
-#define AP_MAVLINK_MAV_CMD_REQUEST_AUTOPILOT_CAPABILITIES_ENABLED 1
+/// Enable GPS telemetry
+#ifndef EDUCOPTER_GPS_ENABLED
+#define EDUCOPTER_GPS_ENABLED 1
 #endif
 
-#ifndef HAL_MAVLINK_INTERVALS_FROM_FILES_ENABLED
-#define HAL_MAVLINK_INTERVALS_FROM_FILES_ENABLED ((AP_FILESYSTEM_FATFS_ENABLED || AP_FILESYSTEM_LITTLEFS_ENABLED || AP_FILESYSTEM_POSIX_ENABLED) && HAL_PROGRAM_SIZE_LIMIT_KB > 1024)
+/// Enable RC channels telemetry
+#ifndef EDUCOPTER_RC_TELEMETRY_ENABLED
+#define EDUCOPTER_RC_TELEMETRY_ENABLED 1
 #endif
 
-#ifndef AP_MAVLINK_MSG_RELAY_STATUS_ENABLED
-#define AP_MAVLINK_MSG_RELAY_STATUS_ENABLED HAL_GCS_ENABLED && AP_RELAY_ENABLED
+// ========== MISSION MANAGEMENT ==========
+
+/// Enable mission (waypoint) upload/download
+#ifndef EDUCOPTER_MISSION_ENABLED
+#define EDUCOPTER_MISSION_ENABLED 1
 #endif
 
-// allow removal of developer-centric mavlink commands
-#ifndef AP_MAVLINK_FAILURE_CREATION_ENABLED
-#define AP_MAVLINK_FAILURE_CREATION_ENABLED 1
+/// Enable geofence management
+#ifndef EDUCOPTER_FENCE_ENABLED
+#define EDUCOPTER_FENCE_ENABLED 1
 #endif
 
-// CODE_REMOVAL
-// ArduPilot 4.6 sends deprecation warnings for RALLY_POINT/RALLY_FETCH_POINT
-// ArduPilot 4.7 stops compiling them in by default
-// ArduPilot 4.8 removes the code entirely
-#ifndef AP_MAVLINK_RALLY_POINT_PROTOCOL_ENABLED
-#define AP_MAVLINK_RALLY_POINT_PROTOCOL_ENABLED 0
+/// Enable rally point management
+#ifndef EDUCOPTER_RALLY_ENABLED
+#define EDUCOPTER_RALLY_ENABLED 1
 #endif
 
-// this is for both read and write messages:
-#ifndef AP_MAVLINK_MSG_DEVICE_OP_ENABLED
-#define AP_MAVLINK_MSG_DEVICE_OP_ENABLED HAL_GCS_ENABLED
+/// Maximum number of mission items
+#ifndef EDUCOPTER_MAX_MISSION_ITEMS
+#define EDUCOPTER_MAX_MISSION_ITEMS 100
 #endif
 
-#ifndef AP_MAVLINK_SERVO_RELAY_ENABLED
-#define AP_MAVLINK_SERVO_RELAY_ENABLED HAL_GCS_ENABLED && AP_SERVORELAYEVENTS_ENABLED
+/// Maximum number of fence points
+#ifndef EDUCOPTER_MAX_FENCE_POINTS
+#define EDUCOPTER_MAX_FENCE_POINTS 50
 #endif
 
-#ifndef AP_MAVLINK_MSG_SERIAL_CONTROL_ENABLED
-#define AP_MAVLINK_MSG_SERIAL_CONTROL_ENABLED HAL_GCS_ENABLED
+/// Maximum number of rally points
+#ifndef EDUCOPTER_MAX_RALLY_POINTS
+#define EDUCOPTER_MAX_RALLY_POINTS 10
 #endif
 
-#ifndef AP_MAVLINK_MSG_UAVIONIX_ADSB_OUT_STATUS_ENABLED
-#define AP_MAVLINK_MSG_UAVIONIX_ADSB_OUT_STATUS_ENABLED HAL_ADSB_ENABLED
+// ========== PARAMETER SYSTEM ==========
+
+/// Enable parameter get/set protocol
+#ifndef EDUCOPTER_PARAMETERS_ENABLED
+#define EDUCOPTER_PARAMETERS_ENABLED 1
 #endif
 
-#ifndef AP_MAVLINK_FTP_ENABLED
-#define AP_MAVLINK_FTP_ENABLED HAL_GCS_ENABLED
+/// Maximum number of parameters
+#ifndef EDUCOPTER_MAX_PARAMETERS
+#define EDUCOPTER_MAX_PARAMETERS 500
 #endif
 
-// GCS should be using MISSION_REQUEST_INT instead; this is a waste of
-// flash.  MISSION_REQUEST was deprecated in June 2020.  We started
-// sending warnings to the GCS in Sep 2022 if MISSION_REQUEST was used.
-// Copter 4.4.0 sends this warning.
-// CODE_REMOVAL
-// ArduPilot 4.4 sends warnings if MISSION_ITEM used
-// ArduPilot 4.8 stops compiling in MISSION_ITEM but still sends warnings
-// ArduPilot 4.9 removes the code but sends message about MISSION_ITEM not supported
-// ArduPilot 4.10 stops sending the warning
-#ifndef AP_MAVLINK_MSG_MISSION_REQUEST_ENABLED
-#define AP_MAVLINK_MSG_MISSION_REQUEST_ENABLED AP_MISSION_ENABLED
+// ========== FILE TRANSFER (FTP) ==========
+
+/// Enable MAVLink FTP for file upload/download
+#ifndef EDUCOPTER_FTP_ENABLED
+#define EDUCOPTER_FTP_ENABLED 1
 #endif
 
-// RANGEFINDER is a subset of the DISTANCE_SENSOR message which we
-// also send.  Rover's send-minimum can be done on the client-side.
-#ifndef AP_MAVLINK_MSG_RANGEFINDER_SENDING_ENABLED
-#define AP_MAVLINK_MSG_RANGEFINDER_SENDING_ENABLED AP_RANGEFINDER_ENABLED
+/// Maximum number of concurrent FTP sessions
+#ifndef EDUCOPTER_MAX_FTP_SESSIONS
+#define EDUCOPTER_MAX_FTP_SESSIONS 3
 #endif
 
-// all commands can be executed by COMMAND_INT, so COMMAND_LONG isn't
-// strictly required.  This option created for 4.5, Nov 2023, and code
-// left in place.
-#ifndef AP_MAVLINK_COMMAND_LONG_ENABLED
-#define AP_MAVLINK_COMMAND_LONG_ENABLED 1
+// ========== ADVANCED FEATURES ==========
+
+/// Enable serial port passthrough
+#ifndef EDUCOPTER_SERIAL_CONTROL_ENABLED
+#define EDUCOPTER_SERIAL_CONTROL_ENABLED 1
 #endif
 
-#ifndef AP_MAVLINK_MSG_HIGHRES_IMU_ENABLED
-#define AP_MAVLINK_MSG_HIGHRES_IMU_ENABLED (HAL_PROGRAM_SIZE_LIMIT_KB > 1024) && AP_INERTIALSENSOR_ENABLED
+/// Enable device operations (I2C/SPI via MAVLink)
+#ifndef EDUCOPTER_DEVICE_OP_ENABLED
+#define EDUCOPTER_DEVICE_OP_ENABLED 0  // Disabled by default (security)
 #endif
 
-#ifndef AP_MAVLINK_MAV_CMD_SET_HAGL_ENABLED
-#define AP_MAVLINK_MAV_CMD_SET_HAGL_ENABLED (HAL_PROGRAM_SIZE_LIMIT_KB > 1024)
+/// Enable servo/relay direct control
+#ifndef EDUCOPTER_SERVO_RELAY_ENABLED
+#define EDUCOPTER_SERVO_RELAY_ENABLED 1
 #endif
 
-#ifndef AP_MAVLINK_MSG_VIDEO_STREAM_INFORMATION_ENABLED
-#define AP_MAVLINK_MSG_VIDEO_STREAM_INFORMATION_ENABLED HAL_GCS_ENABLED
+/// Enable high-latency link support (satellite)
+#ifndef EDUCOPTER_HIGH_LATENCY_ENABLED
+#define EDUCOPTER_HIGH_LATENCY_ENABLED 1
 #endif
 
-#ifndef AP_MAVLINK_MSG_FLIGHT_INFORMATION_ENABLED
-#define AP_MAVLINK_MSG_FLIGHT_INFORMATION_ENABLED HAL_GCS_ENABLED && AP_ARMING_ENABLED
-#endif  // AP_MAVLINK_MSG_FLIGHT_INFORMATION_ENABLED
+// ========== CAMERA & GIMBAL ==========
 
-// deprecated 2025-02, replaced by MAV_CMD_DO_SET_GLOBAL_ORIGIN
-// ArduPilot 4.8 starts to warn if anyone uses this
-// ArduPilot 4.9 continues to warn if anyone uses this
-// ArduPilot 4.10 compiles support out
-// ArduPilot 4.11 removes the code
-#ifndef AP_MAVLINK_SET_GPS_GLOBAL_ORIGIN_MESSAGE_ENABLED
-#define AP_MAVLINK_SET_GPS_GLOBAL_ORIGIN_MESSAGE_ENABLED (HAL_GCS_ENABLED && AP_AHRS_ENABLED)
-#endif  // AP_MAVLINK_SET_GPS_GLOBAL_ORIGIN_MESSAGE_ENABLED
+/// Enable camera trigger/feedback
+#ifndef EDUCOPTER_CAMERA_ENABLED
+#define EDUCOPTER_CAMERA_ENABLED 1
+#endif
+
+/// Enable gimbal control
+#ifndef EDUCOPTER_GIMBAL_ENABLED
+#define EDUCOPTER_GIMBAL_ENABLED 1
+#endif
+
+// ========== COLLISION AVOIDANCE ==========
+
+/// Enable ADSB/ADS-B traffic reception
+#ifndef EDUCOPTER_ADSB_ENABLED
+#define EDUCOPTER_ADSB_ENABLED 1
+#endif
+
+// ========== OPTICAL FLOW ==========
+
+/// Enable optical flow sensor
+#ifndef EDUCOPTER_OPTICAL_FLOW_ENABLED
+#define EDUCOPTER_OPTICAL_FLOW_ENABLED 1
+#endif
+
+// ========== RANGEFINDERS ==========
+
+/// Enable rangefinder/Lidar
+#ifndef EDUCOPTER_RANGEFINDER_ENABLED
+#define EDUCOPTER_RANGEFINDER_ENABLED 1
+#endif
+
+/// Enable proximity sensors (360° obstacle detection)
+#ifndef EDUCOPTER_PROXIMITY_ENABLED
+#define EDUCOPTER_PROXIMITY_ENABLED 1
+#endif
+
+// ========== DEBUG & DEVELOPMENT ==========
+
+/// Enable debug message timing (profiling)
+#ifndef EDUCOPTER_GCS_DEBUG_TIMING
+#define EDUCOPTER_GCS_DEBUG_TIMING 0  // Disabled by default
+#endif
+
+/// Enable verbose logging
+#ifndef EDUCOPTER_GCS_VERBOSE_LOGGING
+#define EDUCOPTER_GCS_VERBOSE_LOGGING 0  // Disabled by default
+#endif
+
+/// Enable developer failure injection commands (testing only)
+#ifndef EDUCOPTER_FAILURE_INJECTION_ENABLED
+#define EDUCOPTER_FAILURE_INJECTION_ENABLED 0  // Disabled by default
+#endif
+
+// ========== BUFFER SIZES ==========
+
+/// MAVLink TX buffer size per channel (bytes)
+#ifndef EDUCOPTER_MAVLINK_TX_BUFFER_SIZE
+#define EDUCOPTER_MAVLINK_TX_BUFFER_SIZE 4096
+#endif
+
+/// MAVLink RX buffer size per channel (bytes)
+#ifndef EDUCOPTER_MAVLINK_RX_BUFFER_SIZE
+#define EDUCOPTER_MAVLINK_RX_BUFFER_SIZE 2048
+#endif
+
+/// Statustext queue size (number of messages)
+#ifndef EDUCOPTER_STATUSTEXT_QUEUE_SIZE
+#define EDUCOPTER_STATUSTEXT_QUEUE_SIZE 10
+#endif
+
+// ========== TIMING CONFIGURATION ==========
+
+/// Heartbeat rate (Hz)
+#ifndef EDUCOPTER_HEARTBEAT_RATE_HZ
+#define EDUCOPTER_HEARTBEAT_RATE_HZ 1
+#endif
+
+/// Default telemetry stream rate (Hz) - if not configured
+#ifndef EDUCOPTER_DEFAULT_STREAM_RATE_HZ
+#define EDUCOPTER_DEFAULT_STREAM_RATE_HZ 4
+#endif
+
+/// Parameter send rate (parameters/second)
+#ifndef EDUCOPTER_PARAMETER_SEND_RATE
+#define EDUCOPTER_PARAMETER_SEND_RATE 50
+#endif
+
+/// Mission item timeout (milliseconds)
+#ifndef EDUCOPTER_MISSION_TIMEOUT_MS
+#define EDUCOPTER_MISSION_TIMEOUT_MS 5000
+#endif
+
+// ========== COMPATIBILITY ==========
+
+/// Support legacy COMMAND_LONG (not just COMMAND_INT)
+#ifndef EDUCOPTER_COMMAND_LONG_ENABLED
+#define EDUCOPTER_COMMAND_LONG_ENABLED 1
+#endif
+
+/// Support legacy MISSION_REQUEST (not just MISSION_REQUEST_INT)
+#ifndef EDUCOPTER_MISSION_REQUEST_LEGACY_ENABLED
+#define EDUCOPTER_MISSION_REQUEST_LEGACY_ENABLED 1
+#endif
+
+// ========== EDUCATIONAL FEATURES ==========
+
+/// Enable detailed status messages for students
+#ifndef EDUCOPTER_EDUCATIONAL_MESSAGES
+#define EDUCOPTER_EDUCATIONAL_MESSAGES 1
+#endif
+
+/// Enable performance monitoring messages
+#ifndef EDUCOPTER_PERFORMANCE_MONITORING
+#define EDUCOPTER_PERFORMANCE_MONITORING 1
+#endif
+
+/// Enable flight mode explanation messages
+#ifndef EDUCOPTER_MODE_EXPLANATIONS
+#define EDUCOPTER_MODE_EXPLANATIONS 1
+#endif
+
+// ========== COMPILE-TIME CHECKS ==========
+
+#if EDUCOPTER_MAX_MAVLINK_CHANNELS > 8
+#error "Maximum 8 MAVLink channels supported"
+#endif
+
+#if EDUCOPTER_MAX_MISSION_ITEMS > 1000
+#error "Maximum 1000 mission items supported"
+#endif
+
+#if EDUCOPTER_MAVLINK_TX_BUFFER_SIZE < 1024
+#error "TX buffer must be at least 1024 bytes"
+#endif
+
+// ========== FEATURE DEPENDENCY CHECKS ==========
+
+#if EDUCOPTER_FTP_ENABLED && !EDUCOPTER_GCS_ENABLED
+#error "FTP requires GCS to be enabled"
+#endif
+
+#if EDUCOPTER_MISSION_ENABLED && !EDUCOPTER_PARAMETERS_ENABLED
+#error "Mission management requires parameter system"
+#endif
+
+#if EDUCOPTER_MAVLINK_SIGNING_ENABLED && !EDUCOPTER_MAVLINK2_ENABLED
+#error "Message signing requires MAVLink 2.0"
+#endif
+
+} // namespace Config
+} // namespace GCS
+} // namespace EduCopter

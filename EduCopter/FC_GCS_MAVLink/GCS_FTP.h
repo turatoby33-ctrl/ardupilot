@@ -1,118 +1,289 @@
-/*
-  implementation of FILE_TRANSFER_PROTOCOL MAVLink sub-protocol
+/**
+ * @file GCS_FTP.h
+ * @brief EduCopter MAVLink FTP (File Transfer Protocol)
+ *
+ * Implements file upload/download over MAVLink using
+ * FILE_TRANSFER_PROTOCOL message.
+ *
+ * @author EduCopter Project
+ * @date 2025-10-28
+ * @version 1.0.0
  */
 
 #pragma once
 
 #include "GCS_config.h"
 
-#if AP_MAVLINK_FTP_ENABLED
+#if EDUCOPTER_FTP_ENABLED
 
-#include "GCS.h"
+#include "GCS_MAVLink.h"
+#include <stdint.h>
 
-#ifndef AP_MAVLINK_FTP_MAX_SESSIONS
-#define AP_MAVLINK_FTP_MAX_SESSIONS 5
-#endif
+namespace EduCopter {
+namespace GCS {
 
-class GCS_FTP {
-public:
-    static void handle_file_transfer_protocol(const mavlink_message_t &msg, mavlink_channel_t chan);
-    static uint32_t get_last_send_ms(mavlink_channel_t chan);
+/// Maximum FTP payload size
+#define EDUCOPTER_FTP_PAYLOAD_SIZE 239
 
-private:
-    enum class FTP_OP : uint8_t {
-        None = 0,
-        TerminateSession = 1,
-        ResetSessions = 2,
-        ListDirectory = 3,
-        OpenFileRO = 4,
-        ReadFile = 5,
-        CreateFile = 6,
-        WriteFile = 7,
-        RemoveFile = 8,
-        CreateDirectory = 9,
-        RemoveDirectory = 10,
-        OpenFileWO = 11,
-        TruncateFile = 12,
-        Rename = 13,
-        CalcFileCRC32 = 14,
-        BurstReadFile = 15,
-        Ack = 128,
-        Nack = 129,
-    };
-
-    enum class FTP_ERROR : uint8_t {
-        None = 0,
-        Fail = 1,
-        FailErrno = 2,
-        InvalidDataSize = 3,
-        InvalidSession = 4,
-        NoSessionsAvailable = 5,
-        EndOfFile = 6,
-        UnknownCommand = 7,
-        FileExists = 8,
-        FileProtected = 9,
-        FileNotFound = 10,
-    };
-
-    struct Transaction {
-        uint32_t offset;
-        mavlink_channel_t chan;        
-        uint16_t seq_number;
-        FTP_OP opcode;
-        FTP_OP req_opcode;
-        bool  burst_complete;
-        uint8_t size;
-        uint8_t session;
-        uint8_t sysid;
-        uint8_t compid;
-        uint8_t data[239];
-    };
-
-    enum class FTP_FILE_MODE {
-        Read,
-        Write,
-    };
-
-    ObjectBuffer<Transaction> requests{AP_MAVLINK_FTP_MAX_SESSIONS};
-
-    bool initialised;
-
-    // session specific info
-    class Session {
-    public:
-        int fd = -1;
-        uint32_t last_send_ms;
-        int16_t session_id;
-        FTP_FILE_MODE mode; // work around AP_Filesystem not supporting file modes
-        mavlink_channel_t chan;
-        uint8_t sysid;
-        uint8_t compid;
-
-        bool check_name_len(const Transaction &request);
-        int gen_dir_entry(char *dest, size_t space, const char * path, const struct dirent * entry); // FTP helper for emitting a dir response
-        void list_dir(Transaction &request, Transaction &response);
-        void push_reply(Transaction &reply);
-        bool handle_request(Transaction &request, Transaction &reply);
-
-        void close(void);
-    };
-    Session sessions[AP_MAVLINK_FTP_MAX_SESSIONS];
-
-    bool init(void);
-
-    static bool send_reply(const Transaction &reply);
-    static void error(Transaction &response, FTP_ERROR error);
-
-    /*
-      setup reply packet to reply to the request
-     */
-    void setup_reply(const Transaction &request, Transaction &reply);
-
-    void worker(void);
-
-    // GCS_FTP instance created by static handle_file_transfer_protocol()
-    static GCS_FTP *ftp;
+/**
+ * @enum FTPOpcode
+ * @brief FTP operation codes
+ */
+enum class FTPOpcode : uint8_t {
+    None = 0,
+    TerminateSession = 1,
+    ResetSessions = 2,
+    ListDirectory = 3,
+    OpenFileRO = 4,
+    ReadFile = 5,
+    CreateFile = 6,
+    WriteFile = 7,
+    RemoveFile = 8,
+    CreateDirectory = 9,
+    RemoveDirectory = 10,
+    OpenFileWO = 11,
+    TruncateFile = 12,
+    Rename = 13,
+    CalcFileCRC32 = 14,
+    BurstReadFile = 15,
+    Ack = 128,
+    Nack = 129
 };
 
-#endif  // AP_MAVLINK_FTP_ENABLED
+/**
+ * @enum FTPError
+ * @brief FTP error codes
+ */
+enum class FTPError : uint8_t {
+    None = 0,
+    Fail = 1,
+    FailErrno = 2,
+    InvalidDataSize = 3,
+    InvalidSession = 4,
+    NoSessionsAvailable = 5,
+    EndOfFile = 6,
+    UnknownCommand = 7,
+    FileExists = 8,
+    FileProtected = 9,
+    FileNotFound = 10
+};
+
+/**
+ * @struct FTPTransaction
+ * @brief Represents a single FTP request/response
+ */
+struct FTPTransaction {
+    uint32_t offset;              ///< File offset
+    uint16_t seqNumber;           ///< Sequence number
+    FTPOpcode opcode;             ///< Operation code
+    FTPOpcode reqOpcode;          ///< Request opcode
+    uint8_t size;                 ///< Data size
+    uint8_t session;              ///< Session ID
+    uint8_t sysid;                ///< System ID
+    uint8_t compid;               ///< Component ID
+    uint8_t data[EDUCOPTER_FTP_PAYLOAD_SIZE]; ///< Payload data
+};
+
+/**
+ * @class FTPSession
+ * @brief Represents an active FTP session
+ */
+class FTPSession {
+public:
+    /**
+     * @brief Constructor
+     */
+    FTPSession();
+
+    /**
+     * @brief Check if session is active
+     */
+    bool isActive() const { return m_active; }
+
+    /**
+     * @brief Open session
+     * @param sessionID Session identifier
+     * @param sysid System ID
+     * @param compid Component ID
+     */
+    void open(uint8_t sessionID, uint8_t sysid, uint8_t compid);
+
+    /**
+     * @brief Close session
+     */
+    void close();
+
+    /**
+     * @brief Open file
+     * @param path File path
+     * @param write true for write, false for read
+     * @return true if successful
+     */
+    bool openFile(const char* path, bool write);
+
+    /**
+     * @brief Close file
+     */
+    void closeFile();
+
+    /**
+     * @brief Read from file
+     * @param buffer Output buffer
+     * @param size Number of bytes to read
+     * @return Bytes read, or -1 on error
+     */
+    int readFile(uint8_t* buffer, uint16_t size);
+
+    /**
+     * @brief Write to file
+     * @param buffer Data to write
+     * @param size Number of bytes
+     * @return Bytes written, or -1 on error
+     */
+    int writeFile(const uint8_t* buffer, uint16_t size);
+
+    /**
+     * @brief Seek in file
+     * @param offset Offset to seek to
+     * @return true if successful
+     */
+    bool seekFile(uint32_t offset);
+
+    // Getters
+    uint8_t getSessionID() const { return m_sessionID; }
+    uint8_t getSystemID() const { return m_sysid; }
+    uint8_t getComponentID() const { return m_compid; }
+    uint32_t getLastActivityMS() const { return m_lastActivityMS; }
+
+    /**
+     * @brief Update last activity time
+     */
+    void updateActivity();
+
+private:
+    bool m_active;              ///< Session is active
+    uint8_t m_sessionID;        ///< Session identifier
+    uint8_t m_sysid;            ///< System ID
+    uint8_t m_compid;           ///< Component ID
+    int m_fileHandle;           ///< File handle
+    bool m_writeMode;           ///< Write mode flag
+    uint32_t m_lastActivityMS;  ///< Last activity time
+};
+
+/**
+ * @class GCS_FTP
+ * @brief MAVLink FTP server
+ */
+class GCS_FTP {
+public:
+    /**
+     * @brief Constructor
+     * @param channel GCS channel for communication
+     */
+    explicit GCS_FTP(GCSChannel& channel);
+
+    /**
+     * @brief Destructor
+     */
+    ~GCS_FTP() = default;
+
+    /**
+     * @brief Initialize FTP server
+     * @return true if successful
+     */
+    bool initialize();
+
+    /**
+     * @brief Handle FILE_TRANSFER_PROTOCOL message
+     * @param msg MAVLink message
+     */
+    void handleFileTransferProtocol(const mavlink_message_t& msg);
+
+    /**
+     * @brief Update FTP server (process queued requests)
+     */
+    void update();
+
+private:
+    // ========== SESSION MANAGEMENT ==========
+
+    /**
+     * @brief Allocate a new session
+     * @param sysid System ID
+     * @param compid Component ID
+     * @return Session ID, or 0xFF if none available
+     */
+    uint8_t allocateSession(uint8_t sysid, uint8_t compid);
+
+    /**
+     * @brief Get session by ID
+     * @param sessionID Session identifier
+     * @return Pointer to session, or nullptr if invalid
+     */
+    FTPSession* getSession(uint8_t sessionID);
+
+    /**
+     * @brief Terminate session
+     * @param sessionID Session to terminate
+     */
+    void terminateSession(uint8_t sessionID);
+
+    /**
+     * @brief Reset all sessions
+     */
+    void resetAllSessions();
+
+    /**
+     * @brief Close timed-out sessions
+     * @param timeoutMS Timeout in milliseconds
+     */
+    void closeTimedOutSessions(uint32_t timeoutMS = 30000);
+
+    // ========== REQUEST HANDLERS ==========
+
+    void handleListDirectory(FTPTransaction& request, FTPTransaction& response);
+    void handleOpenFileRO(FTPTransaction& request, FTPTransaction& response);
+    void handleOpenFileWO(FTPTransaction& request, FTPTransaction& response);
+    void handleReadFile(FTPTransaction& request, FTPTransaction& response);
+    void handleWriteFile(FTPTransaction& request, FTPTransaction& response);
+    void handleRemoveFile(FTPTransaction& request, FTPTransaction& response);
+    void handleCreateDirectory(FTPTransaction& request, FTPTransaction& response);
+    void handleRemoveDirectory(FTPTransaction& request, FTPTransaction& response);
+    void handleTruncateFile(FTPTransaction& request, FTPTransaction& response);
+    void handleRename(FTPTransaction& request, FTPTransaction& response);
+    void handleCalcFileCRC32(FTPTransaction& request, FTPTransaction& response);
+    void handleBurstReadFile(FTPTransaction& request, FTPTransaction& response);
+
+    // ========== HELPERS ==========
+
+    /**
+     * @brief Send response
+     * @param response Response transaction
+     * @return true if sent
+     */
+    bool sendResponse(const FTPTransaction& response);
+
+    /**
+     * @brief Send error response
+     * @param request Original request
+     * @param error Error code
+     */
+    void sendError(const FTPTransaction& request, FTPError error);
+
+    /**
+     * @brief Validate path (security check)
+     * @param path Path to validate
+     * @return true if safe
+     */
+    bool validatePath(const char* path);
+
+    // ========== MEMBER VARIABLES ==========
+
+    FTPSession m_sessions[EDUCOPTER_MAX_FTP_SESSIONS]; ///< Active sessions
+    bool m_initialized;                                 ///< Initialized flag
+};
+
+} // namespace GCS
+} // namespace EduCopter
+
+#endif // EDUCOPTER_FTP_ENABLED

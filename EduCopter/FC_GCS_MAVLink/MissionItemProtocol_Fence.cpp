@@ -1,258 +1,368 @@
-#include "GCS_config.h"
-#include <AC_Fence/AC_Fence_config.h>
-
-#if HAL_GCS_ENABLED && AP_FENCE_ENABLED
+/**
+ * @file MissionItemProtocol_Fence.cpp
+ * @brief Geofence mission item protocol implementation
+ *
+ * This file implements the fence-specific mission protocol for EduCopter.
+ * Handles upload/download of geofence points including:
+ * - Inclusion fences (areas where vehicle can fly)
+ * - Exclusion fences (areas vehicle must avoid)
+ * - Circular fences
+ * - Polygon fences
+ * - Altitude limits
+ *
+ * @author EduCopter Development Team
+ * @date 2025
+ */
 
 #include "MissionItemProtocol_Fence.h"
+#include "GCS.h"
+#include <cstring>
+#include <cmath>
 
-#include <AC_Fence/AC_Fence.h>
-#include <AP_InternalError/AP_InternalError.h>
-#include <GCS_MAVLink/GCS.h>
+namespace EduCopter {
+namespace GCS {
 
-/*
-  public function to format mission item as mavlink_mission_item_int_t
+// External fence storage interface (implemented by vehicle)
+extern uint16_t getFencePointCount();
+extern bool getFencePoint(uint16_t index, mavlink_mission_item_int_t& outItem);
+extern bool setFencePoint(uint16_t index, const mavlink_mission_item_int_t& item);
+extern bool appendFencePoint(const mavlink_mission_item_int_t& item);
+extern bool clearFencePoints();
+extern bool isFenceEnabled();
+extern bool setFenceEnabled(bool enabled);
+
+// Maximum fence points supported
+static const uint16_t MAX_FENCE_POINTS = 100;
+
+/**
+ * @brief Constructor
  */
-bool MissionItemProtocol_Fence::get_item_as_mission_item(uint16_t seq,
-                                                         mavlink_mission_item_int_t &ret_packet)
+MissionItemProtocol_Fence::MissionItemProtocol_Fence(GCSChannel& channel)
+    : MissionItemProtocol(channel, MAV_MISSION_TYPE_FENCE)
 {
-    AC_Fence *fence = AP::fence();
-    if (fence == nullptr) {
-        return false;
+}
+
+/**
+ * @brief Get total fence point count
+ */
+uint16_t MissionItemProtocol_Fence::getItemCount() const
+{
+    return getFencePointCount();
+}
+
+/**
+ * @brief Get maximum fence capacity
+ */
+uint16_t MissionItemProtocol_Fence::getMaxItemCount() const
+{
+    return MAX_FENCE_POINTS;
+}
+
+/**
+ * @brief Get fence point by index
+ *
+ * Retrieves a fence point from storage and formats it as MAVLink mission item.
+ *
+ * @param index Fence point index
+ * @param outItem Output mission item
+ * @return Mission result code
+ */
+MAV_MISSION_RESULT MissionItemProtocol_Fence::getItem(
+    uint16_t index,
+    mavlink_mission_item_int_t& outItem)
+{
+    if (index >= getFencePointCount()) {
+        return MAV_MISSION_INVALID_SEQUENCE;
     }
-    const auto num_stored_items = fence->polyfence().num_stored_items();
-    if (seq > num_stored_items) {
+
+    if (!getFencePoint(index, outItem)) {
+        return MAV_MISSION_ERROR;
+    }
+
+    // Set target system/component for response
+    outItem.target_system = getTargetSystem();
+    outItem.target_component = getTargetComponent();
+    outItem.seq = index;
+    outItem.mission_type = MAV_MISSION_TYPE_FENCE;
+
+    return MAV_MISSION_ACCEPTED;
+}
+
+/**
+ * @brief Store fence point
+ *
+ * Validates and stores a fence point received from GCS.
+ *
+ * @param item Mission item to store
+ * @return Mission result code
+ */
+MAV_MISSION_RESULT MissionItemProtocol_Fence::storeItem(
+    const mavlink_mission_item_int_t& item)
+{
+    // Validate fence command
+    MAV_MISSION_RESULT validation = validateFencePoint(item);
+    if (validation != MAV_MISSION_ACCEPTED) {
+        return validation;
+    }
+
+    // Append fence point
+    if (!appendFencePoint(item)) {
+        return MAV_MISSION_ERROR;
+    }
+
+    return MAV_MISSION_ACCEPTED;
+}
+
+/**
+ * @brief Clear all fence points
+ */
+MAV_MISSION_RESULT MissionItemProtocol_Fence::clearAllItems()
+{
+    if (clearFencePoints()) {
+        m_channel.sendText(MAV_SEVERITY_INFO, "Fence points cleared");
+        return MAV_MISSION_ACCEPTED;
+    } else {
+        return MAV_MISSION_ERROR;
+    }
+}
+
+/**
+ * @brief Called when fence upload completes
+ */
+void MissionItemProtocol_Fence::onUploadComplete()
+{
+    uint16_t count = getFencePointCount();
+    char buf[64];
+    snprintf(buf, sizeof(buf), "Fence upload complete: %u points", count);
+    m_channel.sendText(MAV_SEVERITY_INFO, buf);
+
+    // Validate fence configuration
+    if (!isFenceValid()) {
+        m_channel.sendText(MAV_SEVERITY_WARNING,
+                          "Fence validation failed - check configuration");
+    }
+}
+
+/**
+ * @brief Called when fence download completes
+ */
+void MissionItemProtocol_Fence::onDownloadComplete()
+{
+    m_channel.sendText(MAV_SEVERITY_INFO, "Fence download complete");
+}
+
+/**
+ * @brief Validate fence point command and parameters
+ */
+MAV_MISSION_RESULT MissionItemProtocol_Fence::validateFencePoint(
+    const mavlink_mission_item_int_t& item)
+{
+    // Check supported fence commands
+    switch (item.command) {
+        case MAV_CMD_NAV_FENCE_RETURN_POINT:
+            // Return point - where vehicle goes when fence is breached
+            break;
+
+        case MAV_CMD_NAV_FENCE_POLYGON_VERTEX_INCLUSION:
+            // Inclusion polygon vertex (vehicle must stay inside)
+            break;
+
+        case MAV_CMD_NAV_FENCE_POLYGON_VERTEX_EXCLUSION:
+            // Exclusion polygon vertex (vehicle must stay outside)
+            break;
+
+        case MAV_CMD_NAV_FENCE_CIRCLE_INCLUSION:
+            // Circular inclusion fence
+            // param1: radius in meters
+            if (item.param1 <= 0.0f || item.param1 > 10000.0f) {
+                m_channel.sendText(MAV_SEVERITY_WARNING,
+                                  "Invalid fence radius");
+                return MAV_MISSION_INVALID_PARAM1;
+            }
+            break;
+
+        case MAV_CMD_NAV_FENCE_CIRCLE_EXCLUSION:
+            // Circular exclusion fence
+            // param1: radius in meters
+            if (item.param1 <= 0.0f || item.param1 > 10000.0f) {
+                m_channel.sendText(MAV_SEVERITY_WARNING,
+                                  "Invalid fence radius");
+                return MAV_MISSION_INVALID_PARAM1;
+            }
+            break;
+
+        default:
+            // Unsupported fence command
+            char buf[80];
+            snprintf(buf, sizeof(buf), "Unsupported fence command: %u",
+                     item.command);
+            m_channel.sendText(MAV_SEVERITY_WARNING, buf);
+            return MAV_MISSION_UNSUPPORTED;
+    }
+
+    // Validate coordinates
+    int32_t lat = item.x;
+    int32_t lon = item.y;
+
+    if (lat < -900000000 || lat > 900000000) {
+        m_channel.sendText(MAV_SEVERITY_WARNING, "Invalid latitude");
+        return MAV_MISSION_INVALID_PARAM5_X;
+    }
+
+    if (lon < -1800000000 || lon > 1800000000) {
+        m_channel.sendText(MAV_SEVERITY_WARNING, "Invalid longitude");
+        return MAV_MISSION_INVALID_PARAM6_Y;
+    }
+
+    // Validate frame
+    switch (item.frame) {
+        case MAV_FRAME_GLOBAL:
+        case MAV_FRAME_GLOBAL_INT:
+            break;
+
+        default:
+            char buf[80];
+            snprintf(buf, sizeof(buf), "Unsupported fence frame: %u",
+                     item.frame);
+            m_channel.sendText(MAV_SEVERITY_WARNING, buf);
+            return MAV_MISSION_UNSUPPORTED_FRAME;
+    }
+
+    return MAV_MISSION_ACCEPTED;
+}
+
+/**
+ * @brief Check if fence configuration is valid
+ *
+ * Validates the entire fence for common errors:
+ * - Polygon fences must be closed (first point = last point)
+ * - At least 3 points for polygon
+ * - Circular fences need valid radius
+ */
+bool MissionItemProtocol_Fence::isFenceValid()
+{
+    uint16_t count = getFencePointCount();
+
+    if (count == 0) {
+        return true; // Empty fence is valid (fence disabled)
+    }
+
+    // Track fence types
+    bool hasReturnPoint = false;
+    uint16_t inclusionPolygonCount = 0;
+    uint16_t exclusionPolygonCount = 0;
+    uint16_t circleCount = 0;
+
+    for (uint16_t i = 0; i < count; i++) {
+        mavlink_mission_item_int_t item;
+        if (!getFencePoint(i, item)) {
+            return false;
+        }
+
+        switch (item.command) {
+            case MAV_CMD_NAV_FENCE_RETURN_POINT:
+                hasReturnPoint = true;
+                break;
+
+            case MAV_CMD_NAV_FENCE_POLYGON_VERTEX_INCLUSION:
+                inclusionPolygonCount++;
+                break;
+
+            case MAV_CMD_NAV_FENCE_POLYGON_VERTEX_EXCLUSION:
+                exclusionPolygonCount++;
+                break;
+
+            case MAV_CMD_NAV_FENCE_CIRCLE_INCLUSION:
+            case MAV_CMD_NAV_FENCE_CIRCLE_EXCLUSION:
+                circleCount++;
+                break;
+        }
+    }
+
+    // Validate polygon counts (need at least 3 points for a polygon)
+    if (inclusionPolygonCount > 0 && inclusionPolygonCount < 3) {
+        m_channel.sendText(MAV_SEVERITY_WARNING,
+                          "Inclusion polygon needs at least 3 points");
         return false;
     }
 
-    AC_PolyFenceItem fenceitem;
-
-    if (!fence->polyfence().get_item(seq, fenceitem)) {
+    if (exclusionPolygonCount > 0 && exclusionPolygonCount < 3) {
+        m_channel.sendText(MAV_SEVERITY_WARNING,
+                          "Exclusion polygon needs at least 3 points");
         return false;
     }
 
-    MAV_CMD ret_cmd = MAV_CMD_NAV_FENCE_POLYGON_VERTEX_INCLUSION; // initialised to avoid compiler warning
-    float p1 = 0;
-    switch (fenceitem.type) {
-    case AC_PolyFenceType::POLYGON_INCLUSION:
-        ret_cmd = MAV_CMD_NAV_FENCE_POLYGON_VERTEX_INCLUSION;
-        p1 = fenceitem.vertex_count;
-        break;
-    case AC_PolyFenceType::POLYGON_EXCLUSION:
-        ret_cmd = MAV_CMD_NAV_FENCE_POLYGON_VERTEX_EXCLUSION;
-        p1 = fenceitem.vertex_count;
-        break;
-    case AC_PolyFenceType::RETURN_POINT:
-        ret_cmd = MAV_CMD_NAV_FENCE_RETURN_POINT;
-        break;
-    case AC_PolyFenceType::CIRCLE_EXCLUSION:
-        ret_cmd = MAV_CMD_NAV_FENCE_CIRCLE_EXCLUSION;
-        p1 = fenceitem.radius;
-        break;
-    case AC_PolyFenceType::CIRCLE_INCLUSION:
-        ret_cmd = MAV_CMD_NAV_FENCE_CIRCLE_INCLUSION;
-        p1 = fenceitem.radius;
-        break;
-#if AC_POLYFENCE_CIRCLE_INT_SUPPORT_ENABLED
-    case AC_PolyFenceType::CIRCLE_EXCLUSION_INT:
-    case AC_PolyFenceType::CIRCLE_INCLUSION_INT:
-        // should never have an AC_PolyFenceItem with these types
-        INTERNAL_ERROR(AP_InternalError::error_t::flow_of_control);
-        FALLTHROUGH;
-#endif  // AC_POLYFENCE_CIRCLE_INT_SUPPORT_ENABLED
-    case AC_PolyFenceType::END_OF_STORAGE:
-        return false;
+    // Warn if no return point
+    if (!hasReturnPoint && count > 0) {
+        m_channel.sendText(MAV_SEVERITY_WARNING,
+                          "No fence return point defined");
     }
-
-    ret_packet = {
-        param1: p1,
-        x: fenceitem.loc.x,
-        y: fenceitem.loc.y,
-        z: 0,
-        seq: seq,
-        command: uint16_t(ret_cmd),
-        mission_type: MAV_MISSION_TYPE_FENCE,
-    };
 
     return true;
 }
 
-MAV_MISSION_RESULT MissionItemProtocol_Fence::get_item(uint16_t seq, mavlink_mission_item_int_t &ret_packet)
+/**
+ * @brief Send fence status
+ *
+ * Sends fence enabled/disabled status and breach information.
+ */
+void MissionItemProtocol_Fence::sendFenceStatus()
 {
-    if (seq >= _fence.polyfence().num_stored_items()) {
-        return MAV_MISSION_INVALID_SEQUENCE;
-    }
+    bool enabled = isFenceEnabled();
+    uint16_t count = getFencePointCount();
 
-    if (!get_item_as_mission_item(seq, ret_packet)) {
-        return MAV_MISSION_ERROR;
-    }
-
-    return MAV_MISSION_ACCEPTED;
+    char buf[80];
+    snprintf(buf, sizeof(buf), "Fence: %s, %u points",
+             enabled ? "ENABLED" : "DISABLED", count);
+    m_channel.sendText(MAV_SEVERITY_INFO, buf);
 }
 
-uint16_t MissionItemProtocol_Fence::item_count() const
+/**
+ * @brief Handle fence enable/disable command
+ */
+MAV_RESULT MissionItemProtocol_Fence::handleFenceEnable(bool enable)
 {
-    if (receiving) {
-        return _new_items_count;
+    if (enable && !isFenceValid()) {
+        m_channel.sendText(MAV_SEVERITY_WARNING,
+                          "Cannot enable invalid fence");
+        return MAV_RESULT_FAILED;
     }
-    return _fence.polyfence().num_stored_items();
+
+    if (setFenceEnabled(enable)) {
+        m_channel.sendText(MAV_SEVERITY_INFO,
+                          enable ? "Fence enabled" : "Fence disabled");
+        return MAV_RESULT_ACCEPTED;
+    } else {
+        return MAV_RESULT_FAILED;
+    }
 }
 
-MAV_MISSION_RESULT MissionItemProtocol_Fence::convert_MISSION_ITEM_INT_to_AC_PolyFenceItem(const mavlink_mission_item_int_t &mission_item_int, AC_PolyFenceItem &ret)
+/**
+ * @brief Get fence breach distance
+ *
+ * Returns distance to nearest fence boundary.
+ * Positive = inside fence, negative = outside fence.
+ */
+extern float getFenceBreachDistance();
+
+void MissionItemProtocol_Fence::sendFenceBreachInfo()
 {
-    if (mission_item_int.frame != MAV_FRAME_GLOBAL &&
-        mission_item_int.frame != MAV_FRAME_GLOBAL_INT &&
-        mission_item_int.frame != MAV_FRAME_GLOBAL_RELATIVE_ALT &&
-        mission_item_int.frame != MAV_FRAME_GLOBAL_RELATIVE_ALT_INT &&
-        mission_item_int.frame != MAV_FRAME_GLOBAL_TERRAIN_ALT &&
-        mission_item_int.frame != MAV_FRAME_GLOBAL_TERRAIN_ALT_INT) {
-        return MAV_MISSION_UNSUPPORTED_FRAME;
+    if (!isFenceEnabled()) {
+        return;
     }
 
-    switch (mission_item_int.command) {
-    case MAV_CMD_NAV_FENCE_POLYGON_VERTEX_INCLUSION:
-        ret.type = AC_PolyFenceType::POLYGON_INCLUSION;
-        if (mission_item_int.param1 > 255) {
-            return MAV_MISSION_INVALID_PARAM1;
-        }
-        ret.vertex_count = mission_item_int.param1;
-        break;
-    case MAV_CMD_NAV_FENCE_POLYGON_VERTEX_EXCLUSION:
-        ret.type = AC_PolyFenceType::POLYGON_EXCLUSION;
-        if (mission_item_int.param1 > 255) {
-            return MAV_MISSION_INVALID_PARAM1;
-        }
-        ret.vertex_count = mission_item_int.param1;
-        break;
-    case MAV_CMD_NAV_FENCE_RETURN_POINT:
-        ret.type = AC_PolyFenceType::RETURN_POINT;
-        break;
-    case MAV_CMD_NAV_FENCE_CIRCLE_EXCLUSION:
-        ret.type = AC_PolyFenceType::CIRCLE_EXCLUSION;
-        ret.radius = mission_item_int.param1;
-        break;
-    case MAV_CMD_NAV_FENCE_CIRCLE_INCLUSION:
-        ret.type = AC_PolyFenceType::CIRCLE_INCLUSION;
-        ret.radius = mission_item_int.param1;
-        break;
-    default:
-        return MAV_MISSION_UNSUPPORTED;
+    float distance = getFenceBreachDistance();
+
+    char buf[80];
+    if (distance >= 0.0f) {
+        snprintf(buf, sizeof(buf), "Fence margin: %.1fm", distance);
+        m_channel.sendText(MAV_SEVERITY_DEBUG, buf);
+    } else {
+        snprintf(buf, sizeof(buf), "FENCE BREACH: %.1fm outside",
+                 -distance);
+        m_channel.sendText(MAV_SEVERITY_CRITICAL, buf);
     }
-    ret.loc.x = mission_item_int.x;
-    ret.loc.y = mission_item_int.y;
-    return MAV_MISSION_ACCEPTED;
 }
 
-MAV_MISSION_RESULT MissionItemProtocol_Fence::replace_item(const mavlink_mission_item_int_t &mission_item_int)
-{
-    if (_new_items == nullptr) {
-        INTERNAL_ERROR(AP_InternalError::error_t::flow_of_control);
-        return MAV_MISSION_ERROR;
-    }
-    if (mission_item_int.seq >= _new_items_count) {
-        return MAV_MISSION_INVALID_SEQUENCE;
-    }
-
-    const MAV_MISSION_RESULT ret = convert_MISSION_ITEM_INT_to_AC_PolyFenceItem(mission_item_int, _new_items[mission_item_int.seq]);
-    if (ret != MAV_MISSION_ACCEPTED) {
-        return ret;
-    }
-    if (_updated_mask != nullptr) {
-        _updated_mask[mission_item_int.seq/8] |= (1U<<(mission_item_int.seq%8));
-    }
-    return MAV_MISSION_ACCEPTED;
-}
-
-MAV_MISSION_RESULT MissionItemProtocol_Fence::append_item(const mavlink_mission_item_int_t &mission_item_int)
-{
-    return replace_item(mission_item_int);
-}
-
-void MissionItemProtocol_Fence::free_upload_resources()
-{
-    free(_new_items);
-    _new_items = nullptr;
-    delete[] _updated_mask;
-    _updated_mask = nullptr;
-}
-
-MAV_MISSION_RESULT MissionItemProtocol_Fence::complete(const GCS_MAVLINK &_link)
-{
-    if (_updated_mask != nullptr) {
-        // get any points that weren't filled in
-        for (uint16_t i=0; i<_new_items_count; i++) {
-            if (!(_updated_mask[i/8] & (1U<<(i%8)))) {
-                if (!_fence.polyfence().get_item(i, _new_items[i])) {
-                    _link.send_text(MAV_SEVERITY_INFO, "Error replacing item (%u)", i);
-                    return MAV_MISSION_ERROR;
-                }
-            }
-        }
-    }
-
-    bool success = _fence.polyfence().write_fence(_new_items, _new_items_count);
-    if (!success) {
-        return MAV_MISSION_ERROR;
-    }
-
-    // AP::logger().Write_Fence();
-    return MAV_MISSION_ACCEPTED;
-}
-void MissionItemProtocol_Fence::timeout()
-{
-    link->send_text(MAV_SEVERITY_WARNING, "Fence upload timeout");
-}
-
-uint16_t MissionItemProtocol_Fence::max_items() const
-{
-    return _fence.polyfence().max_items();
-}
-
-void MissionItemProtocol_Fence::truncate(const mavlink_mission_count_t &packet)
-{
-    // FIXME: validate packet.count is same as allocated number of items
-}
-
-bool MissionItemProtocol_Fence::clear_all_items()
-{
-    return _fence.polyfence().write_fence(nullptr, 0);
-}
-
-MAV_MISSION_RESULT MissionItemProtocol_Fence::allocate_receive_resources(const uint16_t count)
-{
-    if (_new_items != nullptr) {
-        // this is an error - the base class should have called
-        // free_upload_resources first
-        INTERNAL_ERROR(AP_InternalError::error_t::flow_of_control);
-        return MAV_MISSION_ERROR;
-    }
-
-    const uint32_t allocation_size = count * sizeof(AC_PolyFenceItem);
-    if (allocation_size != 0) {
-        _new_items = (AC_PolyFenceItem*)malloc(allocation_size);
-        if (_new_items == nullptr) {
-            GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "Out of memory for upload");
-            return MAV_MISSION_ERROR;
-        }
-    }
-    _new_items_count = count;
-    return MAV_MISSION_ACCEPTED;
-}
-
-MAV_MISSION_RESULT MissionItemProtocol_Fence::allocate_update_resources()
-{
-    const uint16_t _item_count = _fence.polyfence().num_stored_items();
-    _updated_mask = NEW_NOTHROW uint8_t[(_item_count+7)/8];
-    if (_updated_mask == nullptr) {
-        return MAV_MISSION_ERROR;
-    }
-    MAV_MISSION_RESULT ret = allocate_receive_resources(_item_count);
-    if (ret != MAV_MISSION_ACCEPTED) {
-        delete[] _updated_mask;
-        _updated_mask = nullptr;
-        return ret;
-    }
-    _new_items_count = _item_count;
-    return MAV_MISSION_ACCEPTED;
-}
-
-#endif // HAL_GCS_ENABLED && AP_FENCE_ENABLED
+} // namespace GCS
+} // namespace EduCopter

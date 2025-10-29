@@ -1,108 +1,307 @@
-/*
-   GCS MAVLink functions related to upload and download of rally
-   points with the ArduPilot-specific protocol comprised of
-   MAVLINK_MSG_ID_RALLY_POINT and MAVLINK_MSG_ID_RALLY_FETCH_POINT.
-
-   This program is free software: you can redistribute it and/or modify
-   it under the terms of the GNU General Public License as published by
-   the Free Software Foundation, either version 3 of the License, or
-   (at your option) any later version.
-
-   This program is distributed in the hope that it will be useful,
-   but WITHOUT ANY WARRANTY; without even the implied warranty of
-   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-   GNU General Public License for more details.
-
-   You should have received a copy of the GNU General Public License
-   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+/**
+ * @file GCS_Rally.cpp
+ * @brief Rally point message handlers and commands
+ *
+ * This file implements rally point-related MAVLink message handlers including:
+ * - Rally point status reporting
+ * - Nearest rally point selection
+ * - Rally point distance calculation
+ * - Rally-related commands
+ *
+ * Works in conjunction with MissionItemProtocol_Rally for rally point transfers.
+ *
+ * @author EduCopter Development Team
+ * @date 2025
  */
 
 #include "GCS.h"
-#include <AP_Rally/AP_Rally.h>
-#include <AP_Logger/AP_Logger.h>
+#include "GCS_config.h"
+#include <cstring>
+#include <cmath>
 
-#if AP_MAVLINK_RALLY_POINT_PROTOCOL_ENABLED
+namespace EduCopter {
+namespace GCS {
 
-void GCS_MAVLINK::handle_rally_point(const mavlink_message_t &msg) const
+#if EDUCOPTER_RALLY_ENABLED
+
+// External rally point interface (implemented by vehicle)
+extern uint16_t getRallyPointCount();
+extern uint16_t getNearestRallyIndex();
+extern bool getRallyLocation(uint16_t index, int32_t& outLat, int32_t& outLon, float& outAlt);
+extern void getRallyDistanceBearing(uint16_t index, float& outDistanceM, float& outBearingDeg);
+extern bool setActiveRallyPoint(uint16_t index);
+extern uint16_t getActiveRallyIndex();
+
+/**
+ * @brief Send rally point status
+ *
+ * Sends RALLY_POINT message for a specific rally point.
+ */
+void GCSChannel::sendRallyPoint(uint16_t index)
 {
-    AP_Rally *r = AP::rally();
-    if (r == nullptr) {
+    if (index >= getRallyPointCount()) {
         return;
     }
 
-    mavlink_rally_point_t packet;
-    mavlink_msg_rally_point_decode(&msg, &packet);
-
-    if (packet.idx >= r->get_rally_total() ||
-        packet.idx >= r->get_rally_max()) {
-        send_text(MAV_SEVERITY_WARNING,"Bad rally point ID");
+    if (!hasPayloadSpace(MAVLINK_MSG_ID_RALLY_POINT)) {
         return;
     }
 
-    if (packet.count != r->get_rally_total()) {
-        send_text(MAV_SEVERITY_WARNING,"Bad rally point count");
+    int32_t lat, lon;
+    float alt;
+
+    if (!getRallyLocation(index, lat, lon, alt)) {
         return;
     }
 
-    // sanity check location
-    if (!check_latlng(packet.lat, packet.lng)) {
-        return;
-    }
+    // Get total count
+    uint16_t count = getRallyPointCount();
 
-    RallyLocation rally_point;
-    rally_point.lat = packet.lat;
-    rally_point.lng = packet.lng;
-    rally_point.alt = packet.alt;
-    rally_point.break_alt = packet.break_alt;
-    rally_point.land_dir = packet.land_dir;
-    rally_point.flags = packet.flags;
+    // Convert altitude to int16_t (cm)
+    int16_t altCM = static_cast<int16_t>(alt * 100.0f);
 
-    if (!r->set_rally_point_with_index(packet.idx, rally_point)) {
-        send_text(MAV_SEVERITY_CRITICAL, "Error setting rally point");
+    // Rally flags (default: land immediately)
+    uint8_t flags = 0;
+
+    mavlink_message_t msg;
+    mavlink_msg_rally_point_pack(
+        m_mavlink.getSystemID(),
+        m_mavlink.getComponentID(),
+        &msg,
+        m_mavlink.getSystemID(),
+        m_mavlink.getComponentID(),
+        index,
+        count,
+        lat,
+        lon,
+        altCM,
+        0,  // Break altitude (not used)
+        0,  // Land direction (not used)
+        flags
+    );
+
+    sendMessage(&msg);
+}
+
+/**
+ * @brief Send rally point count
+ *
+ * Sends text message with rally point count.
+ */
+void GCSChannel::sendRallyInfo()
+{
+    uint16_t count = getRallyPointCount();
+
+    char buf[80];
+    if (count == 0) {
+        sendText(MAV_SEVERITY_INFO, "No rally points configured");
+    } else {
+        uint16_t nearest = getNearestRallyIndex();
+        snprintf(buf, sizeof(buf), "Rally points: %u, nearest: %u",
+                 count, nearest);
+        sendText(MAV_SEVERITY_INFO, buf);
     }
 }
 
-void GCS_MAVLINK::handle_rally_fetch_point(const mavlink_message_t &msg)
+/**
+ * @brief Send nearest rally point distance
+ *
+ * Sends distance and bearing to nearest rally point.
+ */
+void GCSChannel::sendNearestRallyDistance()
 {
-    AP_Rally *r = AP::rally();
-    if (r == nullptr) {
+    uint16_t count = getRallyPointCount();
+
+    if (count == 0) {
         return;
     }
 
-    mavlink_rally_fetch_point_t packet;
-    mavlink_msg_rally_fetch_point_decode(&msg, &packet);
+    uint16_t nearest = getNearestRallyIndex();
 
-    if (packet.idx > r->get_rally_total()) {
-        send_text(MAV_SEVERITY_WARNING, "Bad rally point ID");
+    if (nearest >= count) {
         return;
     }
 
-    RallyLocation rally_point;
-    if (!r->get_rally_point_with_index(packet.idx, rally_point)) {
-        send_text(MAV_SEVERITY_WARNING, "Failed to get rally point");
-        return;
-    }
+    float distance, bearing;
+    getRallyDistanceBearing(nearest, distance, bearing);
 
-    mavlink_msg_rally_point_send(chan, msg.sysid, msg.compid, packet.idx,
-                                 r->get_rally_total(), rally_point.lat, rally_point.lng,
-                                 rally_point.alt, rally_point.break_alt, rally_point.land_dir,
-                                 rally_point.flags);
+    char buf[80];
+    snprintf(buf, sizeof(buf), "Nearest rally %u: %.1fm @ %.0f deg",
+             nearest, distance, bearing);
+    sendText(MAV_SEVERITY_INFO, buf);
 }
 
-void GCS_MAVLINK::handle_common_rally_message(const mavlink_message_t &msg)
+/**
+ * @brief Handle MAV_CMD_DO_SET_RALLY command
+ *
+ * Manually selects which rally point to use.
+ */
+MAV_RESULT GCSChannel::handleCommandSetRally(const mavlink_command_long_t& cmd)
 {
-    switch (msg.msgid) {
-    case MAVLINK_MSG_ID_RALLY_POINT:
-        handle_rally_point(msg);
-        break;
-    case MAVLINK_MSG_ID_RALLY_FETCH_POINT:
-        handle_rally_fetch_point(msg);
-        break;
-    default:
-#if CONFIG_HAL_BOARD == HAL_BOARD_SITL
-        AP_HAL::panic("Unhandled common rally message");
-#endif
-        break;
+    // param1: Rally point index
+    uint16_t index = static_cast<uint16_t>(cmd.param1);
+
+    if (index >= getRallyPointCount()) {
+        sendText(MAV_SEVERITY_WARNING, "Invalid rally point index");
+        return MAV_RESULT_FAILED;
+    }
+
+    if (setActiveRallyPoint(index)) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "Active rally point: %u", index);
+        sendText(MAV_SEVERITY_INFO, buf);
+        return MAV_RESULT_ACCEPTED;
+    } else {
+        return MAV_RESULT_FAILED;
     }
 }
-#endif // AP_MAVLINK_RALLY_POINT_PROTOCOL_ENABLED
+
+/**
+ * @brief Send active rally point info
+ *
+ * Sends information about currently active rally point.
+ */
+void GCSChannel::sendActiveRallyInfo()
+{
+    uint16_t count = getRallyPointCount();
+
+    if (count == 0) {
+        sendText(MAV_SEVERITY_INFO, "No rally points");
+        return;
+    }
+
+    uint16_t active = getActiveRallyIndex();
+
+    if (active >= count) {
+        sendText(MAV_SEVERITY_INFO, "No active rally point");
+        return;
+    }
+
+    int32_t lat, lon;
+    float alt;
+
+    if (getRallyLocation(active, lat, lon, alt)) {
+        char buf[100];
+        snprintf(buf, sizeof(buf),
+                 "Active rally %u: %d, %d @ %.1fm",
+                 active, lat, lon, alt);
+        sendText(MAV_SEVERITY_INFO, buf);
+    }
+}
+
+/**
+ * @brief Check rally point health
+ *
+ * Validates rally point configuration.
+ */
+void GCSChannel::checkRallyHealth()
+{
+    uint16_t count = getRallyPointCount();
+
+    if (count == 0) {
+        return; // No rally points is OK
+    }
+
+    // Check if any rally points have invalid coordinates
+    for (uint16_t i = 0; i < count; i++) {
+        int32_t lat, lon;
+        float alt;
+
+        if (!getRallyLocation(i, lat, lon, alt)) {
+            char buf[64];
+            snprintf(buf, sizeof(buf), "Rally point %u is invalid", i);
+            sendText(MAV_SEVERITY_WARNING, buf);
+            continue;
+        }
+
+        // Check for zero coordinates (likely invalid)
+        if (lat == 0 && lon == 0) {
+            char buf[64];
+            snprintf(buf, sizeof(buf),
+                     "Rally point %u has zero coordinates", i);
+            sendText(MAV_SEVERITY_WARNING, buf);
+        }
+
+        // Check for unreasonable altitude
+        if (alt < 0.0f || alt > 5000.0f) {
+            char buf[80];
+            snprintf(buf, sizeof(buf),
+                     "Rally point %u has unusual altitude: %.1fm",
+                     i, alt);
+            sendText(MAV_SEVERITY_WARNING, buf);
+        }
+    }
+}
+
+/**
+ * @brief Send rally point distances
+ *
+ * Sends distance to all rally points.
+ */
+void GCSChannel::sendAllRallyDistances()
+{
+    uint16_t count = getRallyPointCount();
+
+    if (count == 0) {
+        sendText(MAV_SEVERITY_INFO, "No rally points");
+        return;
+    }
+
+    char buf[80];
+    snprintf(buf, sizeof(buf), "Rally distances:");
+    sendText(MAV_SEVERITY_INFO, buf);
+
+    for (uint16_t i = 0; i < count; i++) {
+        float distance, bearing;
+        getRallyDistanceBearing(i, distance, bearing);
+
+        snprintf(buf, sizeof(buf), "  Rally %u: %.1fm @ %.0f deg",
+                 i, distance, bearing);
+        sendText(MAV_SEVERITY_INFO, buf);
+    }
+}
+
+/**
+ * @brief Update rally point monitoring
+ *
+ * Called periodically to update rally point information.
+ */
+void GCSChannel::updateRally()
+{
+    // Update nearest rally point calculation if needed
+    // This is typically done by the vehicle's navigation system
+}
+
+#else // EDUCOPTER_RALLY_ENABLED
+
+// Rally disabled - provide stub implementations
+void GCSChannel::sendRallyPoint(uint16_t index)
+{
+    // No-op
+}
+
+void GCSChannel::sendRallyInfo()
+{
+    sendText(MAV_SEVERITY_INFO, "Rally points not supported in this build");
+}
+
+void GCSChannel::sendNearestRallyDistance()
+{
+    // No-op
+}
+
+MAV_RESULT GCSChannel::handleCommandSetRally(const mavlink_command_long_t& cmd)
+{
+    sendText(MAV_SEVERITY_WARNING, "Rally points not supported");
+    return MAV_RESULT_UNSUPPORTED;
+}
+
+void GCSChannel::updateRally()
+{
+    // No-op
+}
+
+#endif // EDUCOPTER_RALLY_ENABLED
+
+} // namespace GCS
+} // namespace EduCopter

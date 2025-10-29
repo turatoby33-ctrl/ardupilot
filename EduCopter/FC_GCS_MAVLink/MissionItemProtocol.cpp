@@ -1,414 +1,476 @@
-#include "GCS_config.h"
-
-#if HAL_GCS_ENABLED
+/**
+ * @file MissionItemProtocol.cpp
+ * @brief Base implementation for MAVLink mission item protocol
+ *
+ * This file implements the common mission item transfer protocol used for
+ * waypoints, fence points, and rally points. It handles the state machine
+ * for uploading and downloading mission items from ground stations.
+ *
+ * Protocol flow for download (GCS reads from vehicle):
+ * 1. GCS sends MISSION_REQUEST_LIST
+ * 2. Vehicle responds with MISSION_COUNT
+ * 3. GCS sends MISSION_REQUEST_INT for each item
+ * 4. Vehicle responds with MISSION_ITEM_INT
+ * 5. GCS sends MISSION_ACK when complete
+ *
+ * Protocol flow for upload (GCS writes to vehicle):
+ * 1. GCS sends MISSION_COUNT
+ * 2. Vehicle requests items with MISSION_REQUEST_INT
+ * 3. GCS sends MISSION_ITEM_INT
+ * 4. Vehicle sends MISSION_ACK when complete
+ *
+ * @author EduCopter Development Team
+ * @date 2025
+ */
 
 #include "MissionItemProtocol.h"
-
 #include "GCS.h"
+#include <cstring>
 
-void MissionItemProtocol::init_send_requests(GCS_MAVLINK &_link,
-                                             const mavlink_message_t &msg,
-                                             const int16_t _request_first,
-                                             const int16_t _request_last)
+namespace EduCopter {
+namespace GCS {
+
+/**
+ * @brief Mission transfer state
+ */
+enum class MissionState : uint8_t {
+    IDLE = 0,
+    DOWNLOAD_REQUESTED,  // GCS requested mission download
+    DOWNLOADING,         // Sending items to GCS
+    UPLOAD_STARTED,      // GCS initiated upload
+    UPLOADING,          // Receiving items from GCS
+    UPLOAD_COMPLETE     // Upload done, waiting for ACK
+};
+
+/**
+ * @brief Mission transfer context
+ */
+struct MissionContext {
+    MissionState state;
+    uint8_t targetSystem;
+    uint8_t targetComponent;
+    uint16_t itemCount;
+    uint16_t currentIndex;
+    uint32_t lastActivityMS;
+    MAV_MISSION_TYPE missionType;
+};
+
+static MissionContext s_context = {
+    MissionState::IDLE, 0, 0, 0, 0, 0, MAV_MISSION_TYPE_MISSION
+};
+
+// Timeout for mission transfers (30 seconds)
+static const uint32_t MISSION_TIMEOUT_MS = 30000;
+
+/**
+ * @brief Constructor
+ */
+MissionItemProtocol::MissionItemProtocol(GCSChannel& channel,
+                                         MAV_MISSION_TYPE type)
+    : m_channel(channel)
+    , m_missionType(type)
 {
-    // set variables to help handle the expected receiving of commands from the GCS
-    timelast_receive_ms = AP_HAL::millis();    // set time we last received commands to now
-    receiving = true;              // record that we expect to receive commands
-    request_i = _request_first;                 // reset the next expected command number to zero
-    request_last = _request_last;         // record how many commands we expect to receive
-
-    dest_sysid = msg.sysid;       // record system id of GCS who wants to upload the mission
-    dest_compid = msg.compid;     // record component id of GCS who wants to upload the mission
-
-    link = &_link;
-
-    timelast_request_ms = AP_HAL::millis();
-    link->send_message(next_item_ap_message_id());
-
-    mission_item_warning_sent = false;
-    mission_request_warning_sent = false;
-}
-
-void MissionItemProtocol::handle_mission_clear_all(const GCS_MAVLINK &_link,
-                                                   const mavlink_message_t &msg)
-{
-    bool success = true;
-    success = success && cancel_upload(_link, msg);
-    success = success && clear_all_items();
-    send_mission_ack(_link, msg, success ? MAV_MISSION_ACCEPTED : MAV_MISSION_ERROR);
-}
-
-bool MissionItemProtocol::mavlink2_requirement_met(const GCS_MAVLINK &_link, const mavlink_message_t &msg) const
-{
-    // need mavlink2 to do mission types other than mission:
-    if (mission_type() == MAV_MISSION_TYPE_MISSION) {
-        return true;
-    }
-    if (!_link.sending_mavlink1()) {
-        return true;
-    }
-    GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "Need mavlink2 for item transfer");
-    send_mission_ack(_link, msg, MAV_MISSION_UNSUPPORTED);
-    return false;
-}
-
-// returns true if we are either not receiving, or we successfully
-// cancelled an existing upload:
-bool MissionItemProtocol::cancel_upload(const GCS_MAVLINK &_link, const mavlink_message_t &msg)
-{
-    if (receiving) {
-        // someone is already uploading a mission.  If we are
-        // receiving from someone then we will allow them to restart -
-        // otherwise we deny.
-        if (msg.sysid != dest_sysid || msg.compid != dest_compid) {
-            // reject another upload until
-            send_mission_ack(_link, msg, MAV_MISSION_DENIED);
-            return false;
-        }
-        // the upload count may have changed; free resources and
-        // allocate them again:
-        free_upload_resources();
-        receiving = false;
-        link = nullptr;
-    }
-
-    return true;
-}
-
-void MissionItemProtocol::handle_mission_count(
-    GCS_MAVLINK &_link,
-    const mavlink_mission_count_t &packet,
-    const mavlink_message_t &msg)
-{
-    if (!mavlink2_requirement_met(_link, msg)) {
-        return;
-    }
-
-    if (!cancel_upload(_link, msg)) {
-        return;
-    }
-
-    if (packet.count > max_items()) {
-        // FIXME: different items take up different storage space!
-        send_mission_ack(_link, msg, MAV_MISSION_NO_SPACE);
-        GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "Only %u items are supported", (unsigned)max_items());
-        return;
-    }
-
-    MAV_MISSION_RESULT ret_alloc = allocate_receive_resources(packet.count);
-    if (ret_alloc != MAV_MISSION_ACCEPTED) {
-        send_mission_ack(_link, msg, ret_alloc);
-        return;
-    }
-
-    truncate(packet);
-
-    if (packet.count == 0) {
-        // no requests to send...
-        transfer_is_complete(_link, msg);
-        return;
-    }
-
-    // start waypoint receiving
-    init_send_requests(_link, msg, 0, packet.count-1);
-}
-
-void MissionItemProtocol::handle_mission_request_list(
-    const GCS_MAVLINK &_link,
-    const mavlink_mission_request_list_t &packet,
-    const mavlink_message_t &msg)
-{
-    if (!mavlink2_requirement_met(_link, msg)) {
-        return;
-    }
-
-    if (receiving) {
-        // someone is uploading a mission; reject fetching of points
-        // until done or timeout
-        send_mission_ack(_link, msg, MAV_MISSION_DENIED);
-        return;
-    }
-
-    // reply with number of commands in the mission.  The GCS will
-    // then request each command separately
-    CHECK_PAYLOAD_SIZE2_VOID(_link.get_chan(), MISSION_COUNT);
-    mavlink_msg_mission_count_send(_link.get_chan(),
-                                   msg.sysid,
-                                   msg.compid,
-                                   item_count(),
-                                   mission_type());
-}
-
-void MissionItemProtocol::handle_mission_request_int(GCS_MAVLINK &_link,
-                                                     const mavlink_mission_request_int_t &packet,
-                                                     const mavlink_message_t &msg)
-{
-    if (!mavlink2_requirement_met(_link, msg)) {
-        return;
-    }
-
-    if (receiving) {
-        // someone is uploading a mission; reject fetching of points
-        // until done or timeout
-        send_mission_ack(_link, msg, MAV_MISSION_DENIED);
-        return;
-    }
-
-    mavlink_mission_item_int_t ret_packet;
-    const MAV_MISSION_RESULT result_code = get_item(packet.seq, ret_packet);
-    if (result_code != MAV_MISSION_ACCEPTED) {
-        if (result_code == MAV_MISSION_INVALID_SEQUENCE) {
-            // try to educate the GCS on the actual size of the mission:
-            const mavlink_channel_t chan = _link.get_chan();
-            if (HAVE_PAYLOAD_SPACE(chan, MISSION_COUNT)) {
-                mavlink_msg_mission_count_send(chan,
-                                               msg.sysid,
-                                               msg.compid,
-                                               item_count(),
-                                               mission_type());
-            }
-        }
-        // send failure message
-        send_mission_ack(_link, msg, result_code);
-        return;
-    }
-
-    ret_packet.target_system = msg.sysid;
-    ret_packet.target_component = msg.compid;
-
-    _link.send_message(MAVLINK_MSG_ID_MISSION_ITEM_INT, (const char*)&ret_packet);
-}
-
-#if AP_MAVLINK_MSG_MISSION_REQUEST_ENABLED
-void MissionItemProtocol::handle_mission_request(GCS_MAVLINK &_link,
-                                                 const mavlink_mission_request_t &packet,
-                                                 const mavlink_message_t &msg
-)
-{
-    if (!mavlink2_requirement_met(_link, msg)) {
-        return;
-    }
-
-    mavlink_mission_item_int_t item_int;
-    MAV_MISSION_RESULT ret = get_item(packet.seq, item_int);
-    if (ret != MAV_MISSION_ACCEPTED) {
-        send_mission_ack(_link, msg, ret);
-        return;
-    }
-
-    item_int.target_system = msg.sysid;
-    item_int.target_component = msg.compid;
-
-    mavlink_mission_item_t ret_packet{};
-    ret = AP_Mission::convert_MISSION_ITEM_INT_to_MISSION_ITEM(item_int, ret_packet);
-    if (ret != MAV_MISSION_ACCEPTED) {
-        send_mission_ack(_link, msg, ret);
-        return;
-    }
-
-    if (!mission_request_warning_sent) {
-        mission_request_warning_sent = true;
-        GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "got MISSION_REQUEST; use MISSION_REQUEST_INT!");
-    }
-
-    // buffer space is checked by send_message
-    _link.send_message(MAVLINK_MSG_ID_MISSION_ITEM, (const char*)&ret_packet);
-}
-#endif  // AP_MAVLINK_MSG_MISSION_REQUEST_ENABLED
-
-void MissionItemProtocol::send_mission_item_warning()
-{
-    if (mission_item_warning_sent) {
-        return;
-    }
-    mission_item_warning_sent = true;
-    GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "got MISSION_ITEM; GCS should send MISSION_ITEM_INT");
-}
-
-void MissionItemProtocol::handle_mission_write_partial_list(GCS_MAVLINK &_link,
-                                                            const mavlink_message_t &msg,
-                                                            const mavlink_mission_write_partial_list_t &packet)
-{
-    if (!mavlink2_requirement_met(_link, msg)) {
-        return;
-    }
-
-    if (receiving) {
-        // someone is already uploading a mission.  Deny ability to
-        // write a partial list here as they might be trying to
-        // overwrite a subset of the waypoints which the current
-        // transfer is uploading, and that may lead to storing a whole
-        // bunch of empty items.
-        send_mission_ack(_link, msg, MAV_MISSION_DENIED);
-        return;
-    }
-
-    // start waypoint receiving
-    if ((unsigned)packet.start_index > item_count() ||
-        (unsigned)packet.end_index > item_count() ||
-        packet.end_index < packet.start_index) {
-        GCS_SEND_TEXT(MAV_SEVERITY_WARNING,"Flight plan update rejected"); // FIXME: Remove this anytime after 2020-01-22
-        send_mission_ack(_link, msg, MAV_MISSION_ERROR);
-        return;
-    }
-
-    MAV_MISSION_RESULT ret_alloc = allocate_update_resources();
-    if (ret_alloc != MAV_MISSION_ACCEPTED) {
-        send_mission_ack(_link, msg, ret_alloc);
-        return;
-    }
-
-    init_send_requests(_link, msg, packet.start_index, packet.end_index);
-}
-
-void MissionItemProtocol::handle_mission_item(const mavlink_message_t &msg, const mavlink_mission_item_int_t &cmd)
-{
-    if (link == nullptr) {
-        INTERNAL_ERROR(AP_InternalError::error_t::gcs_bad_missionprotocol_link);
-        return;
-    }
-
-    // check if this is the requested waypoint
-    if (cmd.seq != request_i) {
-        send_mission_ack(msg, MAV_MISSION_INVALID_SEQUENCE);
-        return;
-    }
-    // make sure the item is coming from the system that initiated the upload
-    if (msg.sysid != dest_sysid) {
-        send_mission_ack(msg, MAV_MISSION_DENIED);
-        return;
-    }
-    if (msg.compid != dest_compid) {
-        send_mission_ack(msg, MAV_MISSION_DENIED);
-        return;
-    }
-
-    const uint16_t _item_count = item_count();
-
-    MAV_MISSION_RESULT result;
-    if (cmd.seq < _item_count) {
-        // command index is within the existing list, replace the command
-        result = replace_item(cmd);
-    } else if (cmd.seq == _item_count) {
-        // command is at the end of command list, add the command
-        result = append_item(cmd);
-    } else {
-        // beyond the end of the command list, return an error
-        result = MAV_MISSION_ERROR;
-    }
-    if (result != MAV_MISSION_ACCEPTED) {
-        send_mission_ack(msg, result);
-        receiving = false;
-        link = nullptr;
-        free_upload_resources();
-        return;
-    }
-
-    // update waypoint receiving state machine
-    timelast_receive_ms = AP_HAL::millis();
-    request_i++;
-
-    if (request_i > request_last) {
-        transfer_is_complete(*link, msg);
-        return;
-    }
-    // if we have enough space, then send the next WP request immediately
-    if (HAVE_PAYLOAD_SPACE(link->get_chan(), MISSION_REQUEST)) {
-        queued_request_send();
-    } else {
-        link->send_message(next_item_ap_message_id());
-    }
-}
-
-void MissionItemProtocol::transfer_is_complete(const GCS_MAVLINK &_link, const mavlink_message_t &msg)
-{
-    const MAV_MISSION_RESULT result = complete(_link);
-    send_mission_ack(_link, msg, result);
-    free_upload_resources();
-    receiving = false;
-    link = nullptr;
-}
-
-void MissionItemProtocol::send_mission_ack(const mavlink_message_t &msg,
-                                           MAV_MISSION_RESULT result) const
-{
-    if (link == nullptr) {
-        INTERNAL_ERROR(AP_InternalError::error_t::gcs_bad_missionprotocol_link);
-        return;
-    }
-    send_mission_ack(*link, msg, result);
-}
-void MissionItemProtocol::send_mission_ack(const GCS_MAVLINK &_link,
-                                           const mavlink_message_t &msg,
-                                           MAV_MISSION_RESULT result) const
-{
-    CHECK_PAYLOAD_SIZE2_VOID(_link.get_chan(), MISSION_ACK);
-    mavlink_msg_mission_ack_send(_link.get_chan(),
-                                 msg.sysid,
-                                 msg.compid,
-                                 result,
-                                 mission_type());
 }
 
 /**
- * @brief Send the next pending waypoint, called from deferred message
- * handling code
+ * @brief Update mission protocol state machine
+ *
+ * Handles timeouts and retries.
  */
-void MissionItemProtocol::queued_request_send()
-{
-    if (!receiving) {
-        return;
-    }
-    if (request_i > request_last) {
-        return;
-    }
-    if (link == nullptr) {
-        INTERNAL_ERROR(AP_InternalError::error_t::gcs_bad_missionprotocol_link);
-        return;
-    }
-    CHECK_PAYLOAD_SIZE2_VOID(link->get_chan(), MISSION_REQUEST);
-    mavlink_msg_mission_request_send(
-        link->get_chan(),
-        dest_sysid,
-        dest_compid,
-        request_i,
-        mission_type());
-    timelast_request_ms = AP_HAL::millis();
-}
-
 void MissionItemProtocol::update()
 {
-    if (!receiving) {
-        // we don't need to do anything unless we're sending requests
+    if (s_context.state == MissionState::IDLE) {
         return;
     }
-    if (link == nullptr) {
-        INTERNAL_ERROR(AP_InternalError::error_t::gcs_bad_missionprotocol_link);
-        return;
-    }
-    // stop waypoint receiving if timeout
-    const uint32_t tnow = AP_HAL::millis();
-    if (tnow - timelast_receive_ms > upload_timeout_ms) {
-        receiving = false;
-        timeout();
-        const mavlink_channel_t chan = link->get_chan();
-        if (HAVE_PAYLOAD_SPACE(chan, MISSION_ACK)) {
-            mavlink_msg_mission_ack_send(chan,
-                                         dest_sysid,
-                                         dest_compid,
-                                         MAV_MISSION_OPERATION_CANCELLED,
-                                         mission_type());
-        }
-        link = nullptr;
-        free_upload_resources();
-        return;
-    }
-    // resend request if we haven't gotten one:
-    const uint32_t wp_recv_timeout_ms = 1000U + link->get_stream_slowdown_ms();
-    if (tnow - timelast_request_ms > wp_recv_timeout_ms) {
-        timelast_request_ms = tnow;
-        link->send_message(next_item_ap_message_id());
+
+    // Check for timeout
+    uint32_t nowMS = millis();
+    if (nowMS - s_context.lastActivityMS > MISSION_TIMEOUT_MS) {
+        // Timeout - abort transfer
+        sendAck(MAV_MISSION_ERROR);
+        resetState();
+        m_channel.sendText(MAV_SEVERITY_WARNING, "Mission transfer timeout");
     }
 }
 
-#endif  // HAL_GCS_ENABLED
+/**
+ * @brief Handle MISSION_REQUEST_LIST message
+ *
+ * GCS is requesting to download the mission from vehicle.
+ */
+void MissionItemProtocol::handleMissionRequestList(const mavlink_message_t& msg)
+{
+    mavlink_mission_request_list_t packet;
+    mavlink_msg_mission_request_list_decode(&msg, &packet);
+
+    // Check if request is for us and correct mission type
+    if (packet.target_system != m_channel.getSystemID()) {
+        return;
+    }
+
+    if (packet.target_component != m_channel.getComponentID() &&
+        packet.target_component != MAV_COMP_ID_ALL) {
+        return;
+    }
+
+    if (packet.mission_type != m_missionType) {
+        return; // Different mission type
+    }
+
+    // Start download sequence
+    s_context.state = MissionState::DOWNLOAD_REQUESTED;
+    s_context.targetSystem = msg.sysid;
+    s_context.targetComponent = msg.compid;
+    s_context.itemCount = getItemCount();
+    s_context.currentIndex = 0;
+    s_context.lastActivityMS = millis();
+    s_context.missionType = m_missionType;
+
+    // Send mission count
+    sendCount();
+
+    if (s_context.itemCount > 0) {
+        s_context.state = MissionState::DOWNLOADING;
+    } else {
+        s_context.state = MissionState::IDLE;
+    }
+}
+
+/**
+ * @brief Handle MISSION_REQUEST_INT message
+ *
+ * GCS is requesting a specific mission item.
+ */
+void MissionItemProtocol::handleMissionRequestInt(const mavlink_message_t& msg)
+{
+    mavlink_mission_request_int_t packet;
+    mavlink_msg_mission_request_int_decode(&msg, &packet);
+
+    // Verify we're in correct state
+    if (s_context.state != MissionState::DOWNLOADING &&
+        s_context.state != MissionState::UPLOAD_STARTED &&
+        s_context.state != MissionState::UPLOADING) {
+        return;
+    }
+
+    // Check if request is for us and correct mission type
+    if (packet.target_system != m_channel.getSystemID()) {
+        return;
+    }
+
+    if (packet.mission_type != m_missionType) {
+        return;
+    }
+
+    // Validate index
+    if (packet.seq >= s_context.itemCount) {
+        sendAck(MAV_MISSION_INVALID_SEQUENCE);
+        resetState();
+        return;
+    }
+
+    s_context.lastActivityMS = millis();
+
+    // Send requested item
+    MAV_MISSION_RESULT result = sendItem(packet.seq);
+
+    if (result != MAV_MISSION_ACCEPTED) {
+        sendAck(result);
+        resetState();
+    }
+}
+
+/**
+ * @brief Handle MISSION_COUNT message
+ *
+ * GCS is starting an upload of mission items to vehicle.
+ */
+void MissionItemProtocol::handleMissionCount(const mavlink_message_t& msg)
+{
+    mavlink_mission_count_t packet;
+    mavlink_msg_mission_count_decode(&msg, &packet);
+
+    // Check if request is for us and correct mission type
+    if (packet.target_system != m_channel.getSystemID()) {
+        return;
+    }
+
+    if (packet.target_component != m_channel.getComponentID() &&
+        packet.target_component != MAV_COMP_ID_ALL) {
+        return;
+    }
+
+    if (packet.mission_type != m_missionType) {
+        return;
+    }
+
+    // Validate count
+    if (packet.count > getMaxItemCount()) {
+        sendAck(MAV_MISSION_NO_SPACE);
+        return;
+    }
+
+    // Start upload sequence
+    s_context.state = MissionState::UPLOAD_STARTED;
+    s_context.targetSystem = msg.sysid;
+    s_context.targetComponent = msg.compid;
+    s_context.itemCount = packet.count;
+    s_context.currentIndex = 0;
+    s_context.lastActivityMS = millis();
+    s_context.missionType = m_missionType;
+
+    // Clear existing items
+    MAV_MISSION_RESULT result = clearAllItems();
+    if (result != MAV_MISSION_ACCEPTED) {
+        sendAck(result);
+        resetState();
+        return;
+    }
+
+    if (packet.count == 0) {
+        // Empty mission - just ACK
+        sendAck(MAV_MISSION_ACCEPTED);
+        resetState();
+        return;
+    }
+
+    // Request first item
+    requestItem(0);
+    s_context.state = MissionState::UPLOADING;
+}
+
+/**
+ * @brief Handle MISSION_ITEM_INT message
+ *
+ * GCS is sending a mission item during upload.
+ */
+void MissionItemProtocol::handleMissionItemInt(const mavlink_message_t& msg)
+{
+    mavlink_mission_item_int_t packet;
+    mavlink_msg_mission_item_int_decode(&msg, &packet);
+
+    // Verify we're in upload state
+    if (s_context.state != MissionState::UPLOADING) {
+        return;
+    }
+
+    // Check if item is for us and correct mission type
+    if (packet.target_system != m_channel.getSystemID()) {
+        return;
+    }
+
+    if (packet.mission_type != m_missionType) {
+        return;
+    }
+
+    // Validate sequence
+    if (packet.seq != s_context.currentIndex) {
+        sendAck(MAV_MISSION_INVALID_SEQUENCE);
+        resetState();
+        return;
+    }
+
+    s_context.lastActivityMS = millis();
+
+    // Store the item
+    MAV_MISSION_RESULT result = storeItem(packet);
+
+    if (result != MAV_MISSION_ACCEPTED) {
+        sendAck(result);
+        resetState();
+        return;
+    }
+
+    s_context.currentIndex++;
+
+    // Check if upload is complete
+    if (s_context.currentIndex >= s_context.itemCount) {
+        // All items received
+        sendAck(MAV_MISSION_ACCEPTED);
+        resetState();
+        onUploadComplete();
+    } else {
+        // Request next item
+        requestItem(s_context.currentIndex);
+    }
+}
+
+/**
+ * @brief Handle MISSION_ACK message
+ *
+ * GCS acknowledges mission transfer.
+ */
+void MissionItemProtocol::handleMissionAck(const mavlink_message_t& msg)
+{
+    mavlink_mission_ack_t packet;
+    mavlink_msg_mission_ack_decode(&msg, &packet);
+
+    // Check if ACK is for us and correct mission type
+    if (packet.target_system != m_channel.getSystemID()) {
+        return;
+    }
+
+    if (packet.mission_type != m_missionType) {
+        return;
+    }
+
+    // Reset state
+    resetState();
+
+    if (packet.type == MAV_MISSION_ACCEPTED) {
+        onDownloadComplete();
+    } else {
+        m_channel.sendText(MAV_SEVERITY_WARNING, "Mission transfer failed");
+    }
+}
+
+/**
+ * @brief Handle MISSION_CLEAR_ALL message
+ *
+ * GCS requests clearing all mission items.
+ */
+void MissionItemProtocol::handleMissionClearAll(const mavlink_message_t& msg)
+{
+    mavlink_mission_clear_all_t packet;
+    mavlink_msg_mission_clear_all_decode(&msg, &packet);
+
+    // Check if request is for us and correct mission type
+    if (packet.target_system != m_channel.getSystemID()) {
+        return;
+    }
+
+    if (packet.target_component != m_channel.getComponentID() &&
+        packet.target_component != MAV_COMP_ID_ALL) {
+        return;
+    }
+
+    if (packet.mission_type != m_missionType) {
+        return;
+    }
+
+    // Clear all items
+    MAV_MISSION_RESULT result = clearAllItems();
+    sendAck(result);
+}
+
+/**
+ * @brief Send mission count to GCS
+ */
+void MissionItemProtocol::sendCount()
+{
+    mavlink_message_t msg;
+    mavlink_msg_mission_count_pack(
+        m_channel.getSystemID(),
+        m_channel.getComponentID(),
+        &msg,
+        s_context.targetSystem,
+        s_context.targetComponent,
+        s_context.itemCount,
+        m_missionType
+    );
+
+    m_channel.sendMessage(&msg);
+}
+
+/**
+ * @brief Send mission item to GCS
+ */
+MAV_MISSION_RESULT MissionItemProtocol::sendItem(uint16_t index)
+{
+    mavlink_mission_item_int_t item;
+
+    // Get item from derived class
+    MAV_MISSION_RESULT result = getItem(index, item);
+
+    if (result != MAV_MISSION_ACCEPTED) {
+        return result;
+    }
+
+    // Pack and send
+    mavlink_message_t msg;
+    mavlink_msg_mission_item_int_encode(
+        m_channel.getSystemID(),
+        m_channel.getComponentID(),
+        &msg,
+        &item
+    );
+
+    m_channel.sendMessage(&msg);
+
+    return MAV_MISSION_ACCEPTED;
+}
+
+/**
+ * @brief Request mission item from GCS
+ */
+void MissionItemProtocol::requestItem(uint16_t index)
+{
+    mavlink_message_t msg;
+    mavlink_msg_mission_request_int_pack(
+        m_channel.getSystemID(),
+        m_channel.getComponentID(),
+        &msg,
+        s_context.targetSystem,
+        s_context.targetComponent,
+        index,
+        m_missionType
+    );
+
+    m_channel.sendMessage(&msg);
+}
+
+/**
+ * @brief Send mission ACK to GCS
+ */
+void MissionItemProtocol::sendAck(MAV_MISSION_RESULT result)
+{
+    mavlink_message_t msg;
+    mavlink_msg_mission_ack_pack(
+        m_channel.getSystemID(),
+        m_channel.getComponentID(),
+        &msg,
+        s_context.targetSystem,
+        s_context.targetComponent,
+        result,
+        m_missionType
+    );
+
+    m_channel.sendMessage(&msg);
+}
+
+/**
+ * @brief Reset protocol state
+ */
+void MissionItemProtocol::resetState()
+{
+    s_context.state = MissionState::IDLE;
+    s_context.itemCount = 0;
+    s_context.currentIndex = 0;
+}
+
+/**
+ * @brief Check if transfer is in progress
+ */
+bool MissionItemProtocol::isTransferInProgress() const
+{
+    return s_context.state != MissionState::IDLE;
+}
+
+/**
+ * @brief Get current transfer state
+ */
+const char* MissionItemProtocol::getStateName() const
+{
+    switch (s_context.state) {
+        case MissionState::IDLE: return "IDLE";
+        case MissionState::DOWNLOAD_REQUESTED: return "DOWNLOAD_REQUESTED";
+        case MissionState::DOWNLOADING: return "DOWNLOADING";
+        case MissionState::UPLOAD_STARTED: return "UPLOAD_STARTED";
+        case MissionState::UPLOADING: return "UPLOADING";
+        case MissionState::UPLOAD_COMPLETE: return "UPLOAD_COMPLETE";
+        default: return "UNKNOWN";
+    }
+}
+
+} // namespace GCS
+} // namespace EduCopter

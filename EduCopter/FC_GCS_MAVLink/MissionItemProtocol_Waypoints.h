@@ -1,62 +1,53 @@
+/**
+ * @file MissionItemProtocol_Waypoints.h
+ * @brief EduCopter Waypoint Mission Protocol
+ *
+ * Handles upload/download of waypoint missions.
+ *
+ * @author EduCopter Project
+ * @date 2025-10-28
+ * @version 1.0.0
+ */
+
 #pragma once
 
 #include "MissionItemProtocol.h"
 
+#if EDUCOPTER_MISSION_ENABLED
+
+namespace EduCopter {
+namespace GCS {
+
+/**
+ * @class MissionItemProtocol_Waypoints
+ * @brief Waypoint mission transfer protocol
+ */
 class MissionItemProtocol_Waypoints : public MissionItemProtocol {
 public:
-    MissionItemProtocol_Waypoints(class AP_Mission &_mission) :
-        mission(_mission) {}
+    /**
+     * @brief Constructor
+     * @param channel GCS channel for communication
+     */
+    explicit MissionItemProtocol_Waypoints(GCSChannel& channel);
 
-    // mission_type returns the MAV_MISSION mavlink enumeration value
-    // which this module is responsible for handling
-    MAV_MISSION_TYPE mission_type() const override {
-        return MAV_MISSION_TYPE_MISSION;
-    }
-
-    // complete() is called by the base class after all waypoints have
-    // been received.  _link is the link which the last item was
-    // transfered on.
-    MAV_MISSION_RESULT complete(const GCS_MAVLINK &_link) override;
-    // timeout() is called by the base class in the case that the GCS
-    // does not transfer all waypoints to the vehicle.
-    void timeout() override;
-    // truncate() is called to set the absolute number of items.  It
-    // must be less than or equal to the current number of items (you
-    // can't truncate-to a longer list)
-    void truncate(const mavlink_mission_count_t &packet) override;
+    /**
+     * @brief Destructor
+     */
+    ~MissionItemProtocol_Waypoints() override = default;
 
 protected:
-
-    // clear_all_items() is called to clear all items on the vehicle
-    bool clear_all_items() override WARN_IF_UNUSED;
-
-    // next_item_ap_message_id returns an item from the ap_message
-    // enumeration which (when acted upon by the GCS class) will send
-    // a mavlink message to the GCS requesting it upload the next
-    // required waypoint.
-    ap_message next_item_ap_message_id() const override {
-        return MSG_NEXT_MISSION_REQUEST_WAYPOINTS;
-    }
-
-private:
-    AP_Mission &mission;
-
-    // append_item() is called by the base class to add the supplied
-    // item to the end of the list of stored items.
-    MAV_MISSION_RESULT append_item(const mavlink_mission_item_int_t &) override WARN_IF_UNUSED;
-
-    // support for GCS getting waypoints etc from us:
-    MAV_MISSION_RESULT get_item(uint16_t seq, mavlink_mission_item_int_t &ret_packet) override WARN_IF_UNUSED;
-
-    // item_count() returns the number of stored items
-    uint16_t item_count() const override;
-
-    // item_count() returns the maximum number of items which could be
-    // stored on-board
-    uint16_t max_items() const override;
-
-    // replace_item() replaces an item in the stored list
-    MAV_MISSION_RESULT replace_item(const mavlink_mission_item_int_t &) override WARN_IF_UNUSED;
-
+    // Override base class methods
+    uint16_t getItemCount() const override;
+    uint16_t getMaxItems() const override;
+    MAV_MISSION_RESULT getItem(uint16_t index, mavlink_mission_item_int_t& item) override;
+    MAV_MISSION_RESULT appendItem(const mavlink_mission_item_int_t& item) override;
+    MAV_MISSION_RESULT replaceItem(uint16_t index, const mavlink_mission_item_int_t& item) override;
+    bool clearAllItems() override;
+    bool truncate(uint16_t count) override;
+    MAV_MISSION_RESULT onComplete(GCSChannel* channel) override;
 };
 
+} // namespace GCS
+} // namespace EduCopter
+
+#endif // EDUCOPTER_MISSION_ENABLED

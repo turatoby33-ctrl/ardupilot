@@ -1,278 +1,377 @@
-/*
-  Code for handling MAVLink2 signing
-
-   This program is free software: you can redistribute it and/or modify
-   it under the terms of the GNU General Public License as published by
-   the Free Software Foundation, either version 3 of the License, or
-   (at your option) any later version.
-
-   This program is distributed in the hope that it will be useful,
-   but WITHOUT ANY WARRANTY; without even the implied warranty of
-   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-   GNU General Public License for more details.
-
-   You should have received a copy of the GNU General Public License
-   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+/**
+ * @file GCS_Signing.cpp
+ * @brief MAVLink message signing implementation for security
+ *
+ * This file implements MAVLink 2.0 message signing using SHA-256 HMAC.
+ * Message signing provides:
+ * - Authentication: Verify messages come from trusted sources
+ * - Integrity: Detect message tampering
+ * - Replay protection: Prevent replay attacks
+ *
+ * Signing uses:
+ * - 32-byte secret key (shared between vehicle and GCS)
+ * - 48-bit timestamp (prevents replay attacks)
+ * - 6-byte signature (truncated SHA-256)
+ *
+ * @author EduCopter Development Team
+ * @date 2025
  */
 
-#include "GCS_config.h"
-
-#if HAL_GCS_ENABLED
-
 #include "GCS.h"
+#include "GCS_config.h"
+#include <cstring>
+#include <cstdint>
 
-#if AP_MAVLINK_SIGNING_ENABLED
+namespace EduCopter {
+namespace GCS {
 
-extern const AP_HAL::HAL& hal;
+#if EDUCOPTER_SIGNING_ENABLED
 
-// storage object
-StorageAccess GCS_MAVLINK::_signing_storage(StorageManager::StorageKeys);
+// External crypto interface (implemented by vehicle)
+extern void crypto_sha256_hmac(const uint8_t* key, uint32_t keyLen,
+                                const uint8_t* data, uint32_t dataLen,
+                                uint8_t* outHash);
+extern uint64_t getSecureTimestamp48(); // Get 48-bit timestamp
+extern bool loadSigningKey(uint8_t* outKey, uint32_t keySize);
+extern bool saveSigningKey(const uint8_t* key, uint32_t keySize);
 
-// magic for versioning of the structure
-#define SIGNING_KEY_MAGIC 0x3852fcd1
+// Signing configuration
+static const uint32_t SIGNING_KEY_SIZE = 32; // 256 bits
+static const uint32_t SIGNING_SIGNATURE_SIZE = 6; // 48 bits (truncated)
 
-// structure stored in FRAM
-struct SigningKey {
-    uint32_t magic;
+// Signing state
+struct SigningState {
+    bool enabled;
+    bool acceptUnsigned;
+    uint8_t key[SIGNING_KEY_SIZE];
     uint64_t timestamp;
-    uint8_t secret_key[32];
+    uint8_t linkID;
 };
 
-// shared signing_streams structure
-mavlink_signing_streams_t GCS_MAVLINK::signing_streams;
+static SigningState s_signing = {false, true, {0}, 0, 0};
 
-// last time we saved the timestamp
-uint32_t GCS_MAVLINK::last_signing_save_ms;
-
-bool GCS_MAVLINK::signing_key_save(const struct SigningKey &key)
+/**
+ * @brief Initialize message signing
+ *
+ * Loads signing key from persistent storage.
+ */
+bool GCSChannel::initializeSigning()
 {
-    if (_signing_storage.size() < sizeof(key)) {
+    // Load signing key
+    if (!loadSigningKey(s_signing.key, SIGNING_KEY_SIZE)) {
+        sendText(MAV_SEVERITY_WARNING, "No signing key loaded");
+        s_signing.enabled = false;
         return false;
     }
-    return _signing_storage.write_block(0, &key, sizeof(key));
-}
 
-bool GCS_MAVLINK::signing_key_load(struct SigningKey &key)
-{
-    if (_signing_storage.size() < sizeof(key)) {
-        return false;
-    }
-    if (!_signing_storage.read_block(&key, 0, sizeof(key))) {
-        return false;
-    }
-    if (key.magic != SIGNING_KEY_MAGIC) {
-        return false;
-    }
+    s_signing.enabled = true;
+    s_signing.acceptUnsigned = true; // Initially accept unsigned messages
+    s_signing.timestamp = getSecureTimestamp48();
+    s_signing.linkID = 0;
+
+    sendText(MAV_SEVERITY_INFO, "Message signing enabled");
     return true;
 }
 
-/*
-  handle a setup_signing message
+/**
+ * @brief Enable/disable message signing
  */
-void GCS_MAVLINK::handle_setup_signing(const mavlink_message_t &msg) const
+bool GCSChannel::setSigningEnabled(bool enabled)
 {
-    // setting up signing key when armed generally not useful /
-    // possibly not a good idea
-    if (hal.util->get_soft_armed()) {
-        send_text(MAV_SEVERITY_WARNING, "ERROR: Won't setup signing when armed");
-        return;
+    if (enabled && !s_signing.enabled) {
+        // Trying to enable - need valid key
+        return initializeSigning();
     }
 
-    // decode
+    s_signing.enabled = enabled;
+
+    sendText(MAV_SEVERITY_INFO,
+             enabled ? "Signing enabled" : "Signing disabled");
+
+    return true;
+}
+
+/**
+ * @brief Check if signing is enabled
+ */
+bool GCSChannel::isSigningEnabled() const
+{
+    return s_signing.enabled;
+}
+
+/**
+ * @brief Set whether to accept unsigned messages
+ *
+ * @param accept true to accept unsigned messages (less secure)
+ */
+void GCSChannel::setAcceptUnsignedMessages(bool accept)
+{
+    s_signing.acceptUnsigned = accept;
+
+    char buf[80];
+    snprintf(buf, sizeof(buf), "Accept unsigned: %s",
+             accept ? "YES" : "NO");
+    sendText(MAV_SEVERITY_INFO, buf);
+}
+
+/**
+ * @brief Sign an outgoing message
+ *
+ * Adds signature to MAVLink 2 message.
+ */
+bool GCSChannel::signMessage(mavlink_message_t* msg)
+{
+    if (!s_signing.enabled) {
+        return false; // Signing disabled
+    }
+
+    // Get current timestamp
+    uint64_t timestamp = getSecureTimestamp48();
+
+    // Ensure timestamp is monotonically increasing
+    if (timestamp <= s_signing.timestamp) {
+        timestamp = s_signing.timestamp + 1;
+    }
+    s_signing.timestamp = timestamp;
+
+    // Prepare signing buffer
+    // Format: link_id (1 + timestamp (6) + message_data + CRC (2)
+    uint8_t sigBuffer[1 + 6 + 263 + 2]; // Max MAVLink 2 message
+    uint32_t sigLen = 0;
+
+    // Add link ID
+    sigBuffer[sigLen++] = s_signing.linkID;
+
+    // Add timestamp (48 bits, little-endian)
+    for (int i = 0; i < 6; i++) {
+        sigBuffer[sigLen++] = (timestamp >> (i * 8)) & 0xFF;
+    }
+
+    // Add message data (header + payload + checksum)
+    uint32_t msgLen = msg->len + 12; // Header + payload + checksum
+    memcpy(sigBuffer + sigLen, (uint8_t*)msg, msgLen);
+    sigLen += msgLen;
+
+    // Calculate HMAC-SHA256
+    uint8_t hash[32];
+    crypto_sha256_hmac(s_signing.key, SIGNING_KEY_SIZE,
+                       sigBuffer, sigLen, hash);
+
+    // Store signature (first 6 bytes of hash)
+    msg->signature[0] = s_signing.linkID;
+    for (int i = 0; i < 6; i++) {
+        msg->signature[1 + i] = (timestamp >> (i * 8)) & 0xFF;
+    }
+    memcpy(&msg->signature[7], hash, SIGNING_SIGNATURE_SIZE);
+
+    // Mark message as signed
+    msg->incompat_flags |= MAVLINK_IFLAG_SIGNED;
+
+    return true;
+}
+
+/**
+ * @brief Verify signature on incoming message
+ *
+ * Returns true if signature is valid or if unsigned messages are accepted.
+ */
+bool GCSChannel::verifyMessageSignature(const mavlink_message_t* msg)
+{
+    // Check if message is signed
+    if (!(msg->incompat_flags & MAVLINK_IFLAG_SIGNED)) {
+        // Message is unsigned
+        if (s_signing.acceptUnsigned) {
+            return true; // Accept unsigned
+        } else {
+            sendText(MAV_SEVERITY_WARNING, "Unsigned message rejected");
+            return false; // Reject unsigned
+        }
+    }
+
+    if (!s_signing.enabled) {
+        // We're not set up for signing
+        return s_signing.acceptUnsigned;
+    }
+
+    // Extract timestamp from signature
+    uint64_t msgTimestamp = 0;
+    for (int i = 0; i < 6; i++) {
+        msgTimestamp |= ((uint64_t)msg->signature[1 + i]) << (i * 8);
+    }
+
+    // Check for replay attack (timestamp must be newer)
+    if (msgTimestamp <= s_signing.timestamp) {
+        char buf[80];
+        snprintf(buf, sizeof(buf), "Replay attack detected (old timestamp)");
+        sendText(MAV_SEVERITY_WARNING, buf);
+        return false;
+    }
+
+    // Prepare verification buffer (same as signing)
+    uint8_t sigBuffer[1 + 6 + 263 + 2];
+    uint32_t sigLen = 0;
+
+    // Add link ID
+    sigBuffer[sigLen++] = msg->signature[0];
+
+    // Add timestamp
+    for (int i = 0; i < 6; i++) {
+        sigBuffer[sigLen++] = msg->signature[1 + i];
+    }
+
+    // Add message data
+    uint32_t msgLen = msg->len + 12;
+    memcpy(sigBuffer + sigLen, (const uint8_t*)msg, msgLen);
+    sigLen += msgLen;
+
+    // Calculate expected HMAC
+    uint8_t hash[32];
+    crypto_sha256_hmac(s_signing.key, SIGNING_KEY_SIZE,
+                       sigBuffer, sigLen, hash);
+
+    // Compare signatures (first 6 bytes)
+    if (memcmp(&msg->signature[7], hash, SIGNING_SIGNATURE_SIZE) != 0) {
+        sendText(MAV_SEVERITY_WARNING, "Invalid signature");
+        return false;
+    }
+
+    // Signature valid - update our timestamp
+    s_signing.timestamp = msgTimestamp;
+
+    return true;
+}
+
+/**
+ * @brief Handle SETUP_SIGNING message
+ *
+ * Configures signing parameters.
+ */
+void GCSChannel::handleSetupSigning(const mavlink_message_t& msg)
+{
     mavlink_setup_signing_t packet;
     mavlink_msg_setup_signing_decode(&msg, &packet);
 
-    struct SigningKey key {};
-    key.magic = SIGNING_KEY_MAGIC;
-    key.timestamp = packet.initial_timestamp;
-    memcpy(key.secret_key, packet.secret_key, 32);
-
-    if (!signing_key_save(key)) {
-        send_text(MAV_SEVERITY_WARNING, "ERROR: Failed to save signing key");
+    // Check if message is for us
+    if (packet.target_system != m_mavlink.getSystemID()) {
         return;
     }
 
-    // activate it immediately on all links:
-    for (uint8_t i=0; i<MAVLINK_COMM_NUM_BUFFERS; i++) {
-        GCS_MAVLINK *backend = gcs().chan(i);
-        if (backend == nullptr) {
-            return;
-        }
-        backend->load_signing_key();
+    if (packet.target_component != m_mavlink.getComponentID() &&
+        packet.target_component != MAV_COMP_ID_ALL) {
+        return;
+    }
+
+    // Extract secret key
+    memcpy(s_signing.key, packet.secret_key, SIGNING_KEY_SIZE);
+
+    // Set initial timestamp
+    s_signing.timestamp = packet.initial_timestamp;
+
+    // Enable signing
+    s_signing.enabled = true;
+    s_signing.linkID = 0;
+
+    // Save key to persistent storage
+    if (saveSigningKey(s_signing.key, SIGNING_KEY_SIZE)) {
+        sendText(MAV_SEVERITY_INFO, "Signing key saved");
+    } else {
+        sendText(MAV_SEVERITY_WARNING, "Failed to save signing key");
+    }
+
+    sendText(MAV_SEVERITY_INFO, "Message signing configured");
+}
+
+/**
+ * @brief Send signing status
+ */
+void GCSChannel::sendSigningStatus()
+{
+    char buf[100];
+
+    snprintf(buf, sizeof(buf), "Signing: %s",
+             s_signing.enabled ? "ENABLED" : "DISABLED");
+    sendText(MAV_SEVERITY_INFO, buf);
+
+    if (s_signing.enabled) {
+        snprintf(buf, sizeof(buf), "Accept unsigned: %s",
+                 s_signing.acceptUnsigned ? "YES" : "NO");
+        sendText(MAV_SEVERITY_INFO, buf);
+
+        snprintf(buf, sizeof(buf), "Timestamp: %llu",
+                 (unsigned long long)s_signing.timestamp);
+        sendText(MAV_SEVERITY_INFO, buf);
     }
 }
 
-
-/*
-  callback to accept unsigned (or incorrectly signed) packets
+/**
+ * @brief Generate new signing key
+ *
+ * Creates a new random signing key.
  */
-extern "C" {
+extern void crypto_random_bytes(uint8_t* buffer, uint32_t length);
 
-static const uint32_t accept_list[] = {
-    MAVLINK_MSG_ID_RADIO_STATUS,
-    MAVLINK_MSG_ID_RADIO
-};
-    
-static bool accept_unsigned_callback(const mavlink_status_t *status, uint32_t msgId)
+bool GCSChannel::generateSigningKey()
 {
-    if (status == mavlink_get_channel_status(MAVLINK_COMM_0)) {
-        // always accept channel 0, assumed to be secure channel. This
-        // is USB on ChibiOS boards
+    // Generate random key
+    crypto_random_bytes(s_signing.key, SIGNING_KEY_SIZE);
+
+    // Save to storage
+    if (saveSigningKey(s_signing.key, SIGNING_KEY_SIZE)) {
+        sendText(MAV_SEVERITY_INFO, "New signing key generated");
+        s_signing.enabled = true;
+        s_signing.timestamp = getSecureTimestamp48();
         return true;
+    } else {
+        sendText(MAV_SEVERITY_ERROR, "Failed to save signing key");
+        return false;
     }
-    for (uint8_t i=0; i<ARRAY_SIZE(accept_list); i++) {
-        if (accept_list[i] == msgId) {
-            return true;
-        }
-    }
+}
+
+#else // EDUCOPTER_SIGNING_ENABLED
+
+// Signing disabled - provide stub implementations
+bool GCSChannel::initializeSigning()
+{
     return false;
 }
-}
 
-/*
-  load signing key
- */
-void GCS_MAVLINK::load_signing_key(void)
+bool GCSChannel::setSigningEnabled(bool enabled)
 {
-    struct SigningKey key;
-    if (option_enabled(Option::MAVLINK2_SIGNING_DISABLED) || !signing_key_load(key)) {
-        return;
-    }
-    memcpy(signing.secret_key, key.secret_key, 32);
-    signing.link_id = (uint8_t)chan;
-    // use a timestamp 1 minute past the last recorded
-    // timestamp. Combined with saving the key once every 30s this
-    // prevents a window for replay attacks
-    signing.timestamp = key.timestamp + 60UL * 100UL * 1000UL;
-    signing.flags = MAVLINK_SIGNING_FLAG_SIGN_OUTGOING;
-    signing.accept_unsigned_callback = accept_unsigned_callback;
-
-    // if timestamp and key are all zero then we disable signing
-    bool all_zero = (key.timestamp == 0);
-    for (uint8_t i=0; i<sizeof(key.secret_key); i++) {
-        if (signing.secret_key[i] != 0) {
-            all_zero = false;
-            break;
-        }
-    }
-    if (all_zero) {
-        // disable signing
-        _channel_status.signing = nullptr;
-        _channel_status.signing_streams = nullptr;
-    } else {
-        _channel_status.signing = &signing;
-        _channel_status.signing_streams = &signing_streams;
-    }
-}
-
-/*
-  update signing timestamp. This is called when we get GPS lock
-  timestamp_usec is since 1/1/1970 (the epoch)
- */
-void GCS_MAVLINK::update_signing_timestamp(uint64_t timestamp_usec)
-{
-    uint64_t signing_timestamp = (timestamp_usec / (1000*1000ULL));
-    // this is the offset from 1/1/1970 to 1/1/2015
-    const uint64_t epoch_offset = 1420070400;
-    if (signing_timestamp > epoch_offset) {
-        signing_timestamp -= epoch_offset;
-    }
-
-    // convert to 10usec units
-    signing_timestamp *= 100 * 1000ULL;
-
-    // increase signing timestamp on any links that have signing
-    for (uint8_t i=0; i<MAVLINK_COMM_NUM_BUFFERS; i++) {
-        mavlink_channel_t chan = (mavlink_channel_t)(MAVLINK_COMM_0 + i);
-        mavlink_status_t *status = mavlink_get_channel_status(chan);
-        if (status && status->signing && status->signing->timestamp < signing_timestamp) {
-            status->signing->timestamp = signing_timestamp;
-        }
-    }
-
-    // save to stable storage
-    save_signing_timestamp(true);
-}
-
-
-/*
-  save the signing timestamp periodically
- */
-void GCS_MAVLINK::save_signing_timestamp(bool force_save_now)
-{
-    uint32_t now = AP_HAL::millis();
-    // we save the timestamp every 30s, unless forced by a GPS update
-    if (!force_save_now &&  now - last_signing_save_ms < 30*1000UL) {
-        return;
-    }
-
-    last_signing_save_ms = now;
-
-    struct SigningKey key;
-    if (!signing_key_load(key)) {
-        return;
-    }
-    bool need_save = false;
-
-    for (uint8_t i=0; i<MAVLINK_COMM_NUM_BUFFERS; i++) {
-        mavlink_channel_t chan = (mavlink_channel_t)(MAVLINK_COMM_0 + i);
-        const mavlink_status_t *status = mavlink_get_channel_status(chan);
-        if (status && status->signing && status->signing->timestamp > key.timestamp) {
-            key.timestamp = status->signing->timestamp;
-            need_save = true;
-        }
-    }
-    if (need_save) {
-        // save updated key
-        signing_key_save(key);
-    }
-}
-
-/*
-  return true if signing is enabled on this channel
- */
-bool GCS_MAVLINK::signing_enabled(void) const
-{
-    const mavlink_status_t *status = mavlink_get_channel_status(chan);
-    if (status->signing && (status->signing->flags & MAVLINK_SIGNING_FLAG_SIGN_OUTGOING)) {
-        return true;
-    }
+    sendText(MAV_SEVERITY_WARNING, "Signing not supported in this build");
     return false;
 }
-#endif  // AP_MAVLINK_SIGNING_ENABLED
 
-/*
-  return packet overhead in bytes for a channel
- */
-uint8_t GCS_MAVLINK::packet_overhead_chan(mavlink_channel_t chan)
+bool GCSChannel::isSigningEnabled() const
 {
-    /*
-      reserve 100 bytes for parameters when a GCS fails to fetch a
-      parameter due to lack of buffer space. The reservation lasts 2
-      seconds
-     */
-    uint8_t reserved_space = 0;
-    if (reserve_param_space_start_ms != 0 &&
-        AP_HAL::millis() - reserve_param_space_start_ms < 2000) {
-        reserved_space = 100;
-    } else {
-        reserve_param_space_start_ms = 0;
-    }
-    
-    const mavlink_status_t *status = mavlink_get_channel_status(chan);
-    if (status->signing && (status->signing->flags & MAVLINK_SIGNING_FLAG_SIGN_OUTGOING)) {
-        return MAVLINK_NUM_NON_PAYLOAD_BYTES + MAVLINK_SIGNATURE_BLOCK_LEN + reserved_space;
-    }
-    return MAVLINK_NUM_NON_PAYLOAD_BYTES + reserved_space;
+    return false;
 }
 
-#if !AP_MAVLINK_SIGNING_ENABLED
-
-void GCS_MAVLINK::handle_setup_signing(const mavlink_message_t &msg) const
+void GCSChannel::setAcceptUnsignedMessages(bool accept)
 {
-    GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "Signing is not enabled in this firmware");
+    // No-op
 }
 
-#endif  // !AP_MAVLINK_SIGNING_ENABLED
+bool GCSChannel::signMessage(mavlink_message_t* msg)
+{
+    return false;
+}
 
-#endif  // HAL_GCS_ENABLED
+bool GCSChannel::verifyMessageSignature(const mavlink_message_t* msg)
+{
+    return true; // Accept all messages
+}
+
+void GCSChannel::handleSetupSigning(const mavlink_message_t& msg)
+{
+    sendText(MAV_SEVERITY_WARNING, "Signing not supported");
+}
+
+void GCSChannel::sendSigningStatus()
+{
+    sendText(MAV_SEVERITY_INFO, "Signing not supported in this build");
+}
+
+#endif // EDUCOPTER_SIGNING_ENABLED
+
+} // namespace GCS
+} // namespace EduCopter

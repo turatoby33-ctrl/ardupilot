@@ -1,117 +1,319 @@
-//  GCS Message ID's
-/// NOTE: to ensure we never block on sending MAVLink messages
-/// please keep each MSG_ to a single MAVLink message. If need be
-/// create new MSG_ IDs for additional messages on the same
-/// stream
+/**
+ * @file ap_message.h
+ * @brief EduCopter MAVLink Message ID Enumeration
+ *
+ * Custom implementation for EduCopter educational multirotor platform.
+ * Defines internal message identifiers used for scheduling and queuing
+ * telemetry messages to ground control stations.
+ *
+ * @note These are NOT MAVLink message IDs - they are internal enums
+ *       that map to MAVLink messages during transmission.
+ *
+ * @author EduCopter Project
+ * @date 2025-10-28
+ * @version 1.0.0
+ */
 
 #pragma once
 
-#include "GCS_config.h"
+#include <stdint.h>
 
-#include <AP_AHRS/AP_AHRS_config.h>
-#include <AP_Terrain/AP_Terrain_config.h>
+namespace EduCopter {
+namespace GCS {
 
-enum ap_message : uint8_t {
-    MSG_HEARTBEAT                      =   0,
-#if AP_AHRS_ENABLED
-    MSG_AHRS                           =   1,
-    MSG_AHRS2                          =   2,
-    MSG_ATTITUDE                       =   3,
-    MSG_ATTITUDE_QUATERNION            =   4,
-    MSG_LOCATION                       =   5,
-    MSG_VFR_HUD                        =   6,
-#endif
-    MSG_SYS_STATUS                     =   7,
-    MSG_POWER_STATUS                   =   8,
-    MSG_MEMINFO                        =   9,
-    MSG_NAV_CONTROLLER_OUTPUT          =  10,
-    MSG_CURRENT_WAYPOINT               =  11,
-    MSG_SERVO_OUTPUT_RAW               =  12,
-    MSG_RC_CHANNELS                    =  13,
-    MSG_RC_CHANNELS_RAW                =  14,
-    MSG_RAW_IMU                        =  15,
-    MSG_SCALED_IMU                     =  16,
-    MSG_SCALED_IMU2                    =  17,
-    MSG_SCALED_IMU3                    =  18,
-    MSG_SCALED_PRESSURE                =  19,
-    MSG_SCALED_PRESSURE2               =  20,
-    MSG_SCALED_PRESSURE3               =  21,
-    MSG_GPS_RAW                        =  22,
-    MSG_GPS_RTK                        =  23,
-    MSG_GPS2_RAW                       =  24,
-    MSG_GPS2_RTK                       =  25,
-    MSG_SYSTEM_TIME                    =  26,
-    MSG_SERVO_OUT                      =  27,
-    MSG_NEXT_MISSION_REQUEST_WAYPOINTS =  28,
-    MSG_NEXT_MISSION_REQUEST_RALLY     =  29,
-    MSG_NEXT_MISSION_REQUEST_FENCE     =  30,
-    MSG_NEXT_PARAM                     =  31,
-    MSG_FENCE_STATUS                   =  32,
-    MSG_SIMSTATE                       =  33,
-    MSG_SIM_STATE                      =  34,
-    MSG_HWSTATUS                       =  35,
-    MSG_WIND                           =  36,
-#if AP_MAVLINK_MSG_RANGEFINDER_SENDING_ENABLED
-    MSG_RANGEFINDER                    =  37,
-#endif  // AP_MAVLINK_MSG_RANGEFINDER_SENDING_ENABLED
-    MSG_DISTANCE_SENSOR                =  38,
-#if AP_TERRAIN_AVAILABLE
-    MSG_TERRAIN_REQUEST                =  39,
-    MSG_TERRAIN_REPORT                 =  40,
-#endif  // AP_TERRAIN_AVAILABLE
-    MSG_BATTERY2                       =  41,
-    MSG_CAMERA_FEEDBACK                =  42,
-    MSG_CAMERA_INFORMATION             =  43,
-    MSG_CAMERA_SETTINGS                =  44,
-    MSG_CAMERA_FOV_STATUS              =  45,
-    MSG_CAMERA_CAPTURE_STATUS          =  46,
-    MSG_CAMERA_THERMAL_RANGE           =  47,
-    MSG_GIMBAL_DEVICE_ATTITUDE_STATUS  =  48,
-    MSG_GIMBAL_MANAGER_INFORMATION     =  49,
-    MSG_GIMBAL_MANAGER_STATUS          =  50,
-    MSG_VIDEO_STREAM_INFORMATION       =  51,
-    MSG_OPTICAL_FLOW                   =  52,
-    MSG_MAG_CAL_PROGRESS               =  53,
-    MSG_MAG_CAL_REPORT                 =  54,
-    MSG_EKF_STATUS_REPORT              =  55,
-    MSG_LOCAL_POSITION                 =  56,
-    MSG_PID_TUNING                     =  57,
-    MSG_VIBRATION                      =  58,
-    MSG_RPM                            =  59,
-    MSG_WHEEL_DISTANCE                 =  60,
-    MSG_MISSION_ITEM_REACHED           =  61,
-    MSG_POSITION_TARGET_GLOBAL_INT     =  62,
-    MSG_POSITION_TARGET_LOCAL_NED      =  63,
-    MSG_ADSB_VEHICLE                   =  64,
-    MSG_BATTERY_STATUS                 =  65,
-    MSG_AOA_SSA                        =  66,
-    MSG_LANDING                        =  67,
-    MSG_ESC_TELEMETRY                  =  68,
-    MSG_ORIGIN                         =  69,
-    MSG_HOME                           =  70,
-    MSG_NAMED_FLOAT                    =  71,
-    MSG_EXTENDED_SYS_STATE             =  72,
-    MSG_AUTOPILOT_VERSION              =  73,
-    MSG_EFI_STATUS                     =  74,
-    MSG_GENERATOR_STATUS               =  75,
-    MSG_WINCH_STATUS                   =  76,
-    MSG_WATER_DEPTH                    =  77,
-    MSG_HIGH_LATENCY2                  =  78,
-    MSG_AIS_VESSEL                     =  79,
-    MSG_MCU_STATUS                     =  90,
-    MSG_UAVIONIX_ADSB_OUT_STATUS       =  91,
-    MSG_ATTITUDE_TARGET                =  92,
-    MSG_HYGROMETER                     =  93,
-    MSG_AUTOPILOT_STATE_FOR_GIMBAL_DEVICE=94,
-    MSG_RELAY_STATUS                   =  95,
-#if AP_MAVLINK_MSG_HIGHRES_IMU_ENABLED
-    MSG_HIGHRES_IMU                    =  96,
-#endif
-    MSG_AIRSPEED                       =  97,
-    MSG_AVAILABLE_MODES                =  98,
-    MSG_AVAILABLE_MODES_MONITOR        =  99,
-#if AP_MAVLINK_MSG_FLIGHT_INFORMATION_ENABLED
-    MSG_FLIGHT_INFORMATION             = 100,
-#endif
-    MSG_LAST // MSG_LAST must be the last entry in this enum
+/**
+ * @enum MessageID
+ * @brief Internal message identifiers for EduCopter telemetry system
+ *
+ * These IDs are used internally to queue and schedule messages.
+ * Each ID corresponds to one or more MAVLink messages that will
+ * be sent to the ground station.
+ */
+enum class MessageID : uint8_t {
+    // ========== CRITICAL MESSAGES (Highest Priority) ==========
+
+    /// System heartbeat - sent at 1 Hz, indicates vehicle is alive
+    HEARTBEAT = 0,
+
+    /// System status - battery, sensors, CPU load, errors
+    SYSTEM_STATUS = 1,
+
+    /// Power status - voltages, current draw
+    POWER_STATUS = 2,
+
+    // ========== ATTITUDE & NAVIGATION ==========
+
+    /// Roll, pitch, yaw angles (Euler)
+    ATTITUDE = 10,
+
+    /// Attitude as quaternion (more accurate)
+    ATTITUDE_QUATERNION = 11,
+
+    /// Global position (latitude, longitude, altitude)
+    GLOBAL_POSITION = 12,
+
+    /// Local position (NED frame)
+    LOCAL_POSITION = 13,
+
+    /// VFR HUD data (airspeed, groundspeed, heading, altitude, climb rate)
+    VFR_HUD = 14,
+
+    /// Navigation controller output (crosstrack error, bearing, etc.)
+    NAV_CONTROLLER_OUTPUT = 15,
+
+    // ========== SENSORS ==========
+
+    /// Raw IMU data (accelerometer, gyro, magnetometer)
+    RAW_IMU = 20,
+
+    /// Scaled IMU data (in physical units)
+    SCALED_IMU = 21,
+
+    /// Secondary IMU (if available)
+    SCALED_IMU2 = 22,
+
+    /// Tertiary IMU (if available)
+    SCALED_IMU3 = 23,
+
+    /// Barometric pressure sensor
+    SCALED_PRESSURE = 24,
+
+    /// Secondary barometer
+    SCALED_PRESSURE2 = 25,
+
+    /// Tertiary barometer
+    SCALED_PRESSURE3 = 26,
+
+    /// GPS position and velocity
+    GPS_RAW = 27,
+
+    /// GPS RTK data (high-precision)
+    GPS_RTK = 28,
+
+    /// Secondary GPS
+    GPS2_RAW = 29,
+
+    /// Secondary GPS RTK
+    GPS2_RTK = 30,
+
+    // ========== CONTROL INPUTS/OUTPUTS ==========
+
+    /// RC channel values (from receiver)
+    RC_CHANNELS = 40,
+
+    /// RC channels raw (PWM values)
+    RC_CHANNELS_RAW = 41,
+
+    /// Servo/motor output values
+    SERVO_OUTPUT_RAW = 42,
+
+    // ========== MISSION & WAYPOINTS ==========
+
+    /// Current mission item being executed
+    MISSION_CURRENT = 50,
+
+    /// Mission item reached notification
+    MISSION_ITEM_REACHED = 51,
+
+    /// Request next waypoint from GCS
+    MISSION_REQUEST_NEXT_WAYPOINT = 52,
+
+    /// Request next fence point from GCS
+    MISSION_REQUEST_NEXT_FENCE = 53,
+
+    /// Request next rally point from GCS
+    MISSION_REQUEST_NEXT_RALLY = 54,
+
+    // ========== PARAMETERS ==========
+
+    /// Next parameter value to send
+    PARAMETER_VALUE = 60,
+
+    // ========== BATTERY & POWER ==========
+
+    /// Battery status (voltage, current, remaining capacity)
+    BATTERY_STATUS = 70,
+
+    /// Battery #2 status
+    BATTERY2_STATUS = 71,
+
+    // ========== RANGEFINDERS & DISTANCE SENSORS ==========
+
+    /// Rangefinder/Lidar data
+    RANGEFINDER = 80,
+
+    /// Distance sensor (multiple orientations)
+    DISTANCE_SENSOR = 81,
+
+    /// Proximity sensor (360° obstacle detection)
+    PROXIMITY = 82,
+
+    // ========== OPTICAL FLOW ==========
+
+    /// Optical flow sensor data
+    OPTICAL_FLOW = 90,
+
+    // ========== FENCE & SAFETY ==========
+
+    /// Geofence status (breached, distance to fence, etc.)
+    FENCE_STATUS = 100,
+
+    // ========== TIME ==========
+
+    /// System time (boot time + GPS time)
+    SYSTEM_TIME = 110,
+
+    // ========== EXTENDED STATUS ==========
+
+    /// Extended system state (VTOL state, landed state)
+    EXTENDED_SYS_STATE = 120,
+
+    /// Autopilot version and capabilities
+    AUTOPILOT_VERSION = 121,
+
+    // ========== VIBRATION ==========
+
+    /// Vibration levels and clipping
+    VIBRATION = 130,
+
+    // ========== MOTOR/ESC ==========
+
+    /// RPM sensor data
+    RPM = 140,
+
+    /// ESC telemetry (voltage, current, RPM, temperature per ESC)
+    ESC_TELEMETRY = 141,
+
+    // ========== TUNING & DEBUG ==========
+
+    /// PID tuning data (for real-time tuning)
+    PID_TUNING = 150,
+
+    /// Named debug value (float)
+    NAMED_FLOAT = 151,
+
+    /// Memory information
+    MEMINFO = 152,
+
+    /// Hardware status
+    HWSTATUS = 153,
+
+    // ========== AHRS & EKF ==========
+
+    /// AHRS debug information
+    AHRS = 160,
+
+    /// AHRS2 debug information
+    AHRS2 = 161,
+
+    /// EKF status report
+    EKF_STATUS_REPORT = 162,
+
+    // ========== SIMULATION (SITL) ==========
+
+    /// Simulation state (for SITL testing)
+    SIMSTATE = 170,
+
+    /// Simulation state (newer format)
+    SIM_STATE = 171,
+
+    // ========== POSITION TARGETS ==========
+
+    /// Position setpoint (global coordinates)
+    POSITION_TARGET_GLOBAL = 180,
+
+    /// Position setpoint (local NED)
+    POSITION_TARGET_LOCAL = 181,
+
+    /// Attitude setpoint
+    ATTITUDE_TARGET = 182,
+
+    // ========== CAMERA & GIMBAL ==========
+
+    /// Camera feedback (trigger confirmation)
+    CAMERA_FEEDBACK = 190,
+
+    /// Camera information (resolution, etc.)
+    CAMERA_INFORMATION = 191,
+
+    /// Camera settings (mode, zoom, etc.)
+    CAMERA_SETTINGS = 192,
+
+    /// Camera capture status
+    CAMERA_CAPTURE_STATUS = 193,
+
+    /// Gimbal device attitude
+    GIMBAL_DEVICE_ATTITUDE = 194,
+
+    /// Gimbal manager information
+    GIMBAL_MANAGER_INFO = 195,
+
+    /// Gimbal manager status
+    GIMBAL_MANAGER_STATUS = 196,
+
+    // ========== COLLISION AVOIDANCE ==========
+
+    /// ADSB vehicle (traffic)
+    ADSB_VEHICLE = 200,
+
+    // ========== ENVIRONMENTAL ==========
+
+    /// Wind estimate
+    WIND = 210,
+
+    // ========== HOME & ORIGIN ==========
+
+    /// Home position
+    HOME_POSITION = 220,
+
+    /// GPS global origin
+    GPS_GLOBAL_ORIGIN = 221,
+
+    // ========== HIGH LATENCY ==========
+
+    /// Compressed telemetry for satellite links
+    HIGH_LATENCY2 = 230,
+
+    // ========== GENERATOR ==========
+
+    /// Generator status
+    GENERATOR_STATUS = 240,
+
+    // ========== RELAY ==========
+
+    /// Relay status
+    RELAY_STATUS = 250,
+
+    // ========== SENTINEL ==========
+
+    /// Marks the end of valid message IDs - MUST BE LAST
+    MESSAGE_COUNT
 };
+
+/**
+ * @brief Get human-readable name for a message ID
+ * @param id Message identifier
+ * @return Const string with message name
+ */
+const char* messageIDToString(MessageID id);
+
+/**
+ * @brief Check if message ID is valid
+ * @param id Message identifier to check
+ * @return true if valid, false otherwise
+ */
+inline bool isValidMessageID(MessageID id) {
+    return id < MessageID::MESSAGE_COUNT;
+}
+
+/**
+ * @brief Convert message ID to integer
+ * @param id Message identifier
+ * @return uint8_t representation
+ */
+inline uint8_t messageIDToInt(MessageID id) {
+    return static_cast<uint8_t>(id);
+}
+
+} // namespace GCS
+} // namespace EduCopter
