@@ -8,6 +8,8 @@ test_device_op
 test_parameters
 test_serial_control
 test_minimal
+test_waypoints_integrated
+test_serial_control_integrated
 
 # Build artifacts
 *.o
