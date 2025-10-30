@@ -1,0 +1,18 @@
+# Test executables
+test_routing
+test_heartbeat
+test_routing_standalone
+test_heartbeat_standalone
+test_waypoints
+test_device_op
+test_parameters
+test_serial_control
+test_minimal
+
+# Build artifacts
+*.o
+*.a
+*.so
+
+# Test results
+test_results_*.log
