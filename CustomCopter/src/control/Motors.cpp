@@ -38,7 +38,7 @@ Motors::Motors()
     init_quad_x();
 }
 
-bool Motors::init(PWM* pwm) {
+bool Motors::init(HAL::PWM* pwm) {
     if (!pwm) {
         return false;
     }

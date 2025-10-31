@@ -1,0 +1,1 @@
+// GPS implementation (stub)

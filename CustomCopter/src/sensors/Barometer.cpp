@@ -1,0 +1,1 @@
+// Barometer implementation (stub)

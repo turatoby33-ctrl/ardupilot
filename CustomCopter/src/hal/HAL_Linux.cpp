@@ -1,0 +1,1 @@
+// HAL Linux implementation (stub)

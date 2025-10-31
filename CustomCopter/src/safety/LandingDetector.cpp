@@ -1,0 +1,1 @@
+// LandingDetector implementation (stub)

@@ -28,7 +28,7 @@ public:
     virtual ~Motors() = default;
 
     // Initialize motors with HAL PWM interface
-    bool init(PWM* pwm);
+    bool init(HAL::PWM* pwm);
 
     // Set frame type (default: QUAD_X)
     void set_frame_type(FrameType type);
@@ -176,7 +176,7 @@ private:
     // ========================================================================
 
     // HAL interface
-    PWM* pwm_;
+    HAL::PWM* pwm_;
 
     // Frame configuration
     FrameType frame_type_;

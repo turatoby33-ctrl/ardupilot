@@ -1,0 +1,1 @@
+// Arming implementation (stub)

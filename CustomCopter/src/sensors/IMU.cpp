@@ -2,6 +2,7 @@
 #include <cmath>
 #include <random>
 #include <chrono>
+#include <thread>
 
 namespace CustomCopter {
 

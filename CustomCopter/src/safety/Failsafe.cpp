@@ -1,0 +1,1 @@
+// Failsafe implementation (stub)
