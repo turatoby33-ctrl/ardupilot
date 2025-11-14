@@ -1,0 +1,166 @@
+#!/usr/bin/env python
+# encoding: utf-8
+
+"""
+wscript for MiniVehicle
+
+This file configures the build for the MiniVehicle vehicle.
+It tells the waf build system:
+- What source files to compile
+- What libraries to link
+- What executables to create
+"""
+
+def build(bld):
+    """
+    Build configuration for MiniVehicle
+
+    This follows the standard ArduPilot vehicle build pattern:
+    1. Create a library with vehicle sources and dependencies
+    2. Create an executable program that links the library
+    """
+
+    # Get the vehicle name from the directory
+    vehicle = bld.path.name
+
+    # ========================================
+    # VEHICLE LIBRARY
+    # ========================================
+
+    # This creates a static library containing the vehicle code
+    # and all its dependencies
+    bld.ap_stlib(
+        name=vehicle + '_libs',
+        ap_vehicle=vehicle,
+        ap_libraries=bld.ap_common_vehicle_libraries() + [
+            # Core libraries required by MiniVehicle
+            'AP_SerialManager',      # Serial port management
+            'GCS_MAVLink',          # MAVLink communication (CRITICAL!)
+            'AP_AHRS',              # Attitude/heading reference
+            'AP_NavEKF2',           # Extended Kalman Filter
+            'AP_NavEKF3',           # Extended Kalman Filter v3
+            'AP_Compass',           # Compass/magnetometer
+            'AP_GPS',               # GPS
+            'AP_Baro',              # Barometer
+            'AP_InertialSensor',    # IMU (gyros/accels)
+            'AP_RangeFinder',       # Range finders
+            'AP_OpticalFlow',       # Optical flow
+            'AP_Mission',           # Mission handling
+            'AP_Rally',             # Rally points
+            'AP_Terrain',           # Terrain database
+            'AC_Fence',             # Geofence
+            'AP_Motors',            # Motor mixing
+            'AP_Scheduler',         # Task scheduler
+            'AP_RCMapper',          # RC input mapping
+            'AP_Notify',            # LEDs, buzzer, etc.
+            'AP_BattMonitor',       # Battery monitoring
+            'AP_BoardConfig',       # Board configuration
+            'AP_Vehicle',           # Vehicle base class
+            'StorageManager',       # Parameter/mission storage
+            'AP_Arming',            # Arming checks
+            'AP_AccelCal',          # Accelerometer calibration
+            'AP_Airspeed',          # Airspeed sensors
+            'AP_RPM',               # RPM sensors
+            'AP_RSSI',              # RSSI (signal strength)
+            'AP_Mount',             # Camera mount
+            'AP_Camera',            # Camera control
+            'AP_ServoRelayEvents',  # Servo/relay events
+            'AP_Frsky_Telem',       # FrSky telemetry
+            'AP_OSD',               # On-screen display
+            'AP_VideoTX',           # Video transmitter
+            'AP_SmartAudio',        # SmartAudio VTX
+            'AP_Tramp',             # Tramp VTX
+            'AC_PID',               # PID controllers
+            'AP_Stats',             # Flight statistics
+            'AP_Beacon',            # Position beacons
+            'AP_Proximity',         # Proximity sensors
+            'AP_ADSB',              # ADS-B
+            'AP_Button',            # Buttons
+            'AP_Gripper',           # Gripper
+            'AP_LandingGear',       # Landing gear
+            'AP_ICEngine',          # Internal combustion engine
+            'AP_WheelEncoder',      # Wheel encoders
+            'AP_VisualOdom',        # Visual odometry
+            'AP_WindVane',          # Wind vane
+            'AP_RTC',               # Real-time clock
+            'AP_Generator',         # Generator
+            'AP_ExternalAHRS',      # External AHRS
+        ],
+    )
+
+    # ========================================
+    # VEHICLE PROGRAM
+    # ========================================
+
+    # This creates the final executable
+    bld.ap_program(
+        program_name=vehicle,
+        program_groups=['bin', 'minivehicle'],
+        use=vehicle + '_libs',
+    )
+
+"""
+BUILD USAGE:
+
+To build MiniVehicle:
+
+1. Configure for your board:
+   ./waf configure --board=<board_name>
+
+   Common boards:
+   - sitl (Software In The Loop - for testing on PC)
+   - CubeOrange
+   - Pixhawk1
+   - Pixhawk4
+   - etc.
+
+2. Build the vehicle:
+   ./waf minivehicle
+
+   or for specific board:
+   ./waf --targets bin/minivehicle
+
+3. Upload to hardware:
+   ./waf --upload minivehicle
+
+EXAMPLES:
+
+# Build for SITL (simulation):
+./waf configure --board=sitl
+./waf minivehicle
+./build/sitl/bin/minivehicle
+
+# Build for CubeOrange:
+./waf configure --board=CubeOrange
+./waf minivehicle
+./waf --upload minivehicle
+
+# Build with debugging:
+./waf configure --board=sitl --debug
+./waf minivehicle
+gdb ./build/sitl/bin/minivehicle
+
+# Clean build:
+./waf clean
+./waf minivehicle
+
+NOTES:
+
+- The 'program_groups' parameter makes this vehicle available
+  in the 'bin' and 'minivehicle' groups
+
+- The 'ap_libraries' list includes all required libraries
+  GCS_MAVLink is CRITICAL for MAVLink communication!
+
+- The build system automatically handles:
+  - Header dependencies
+  - Library linking order
+  - Board-specific compilation flags
+  - HAL selection
+
+- You can customize the library list based on your needs
+  Remove unused libraries to reduce binary size
+
+- The vehicle will be compiled with all the required
+  ArduPilot infrastructure automatically included
+"""
